@@ -111,7 +111,7 @@ func selectEntry(now time.Time, id string) (ImageEntry, string, error) {
 			continue
 		}
 		if e.OnError == "skip" {
-			if _, _, err := getImageBytes(currentSource(*e, now)); err != nil {
+			if err := probeSource(currentSource(*e, now)); err != nil {
 				continue // fetch failed → counts as inactive for this request
 			}
 		}

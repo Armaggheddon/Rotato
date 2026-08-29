@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
@@ -19,7 +20,8 @@ func handleImage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	entry, src, err := selectEntry(time.Now().UTC(), r.URL.Query().Get("id"))
+	now := time.Now().UTC()
+	entry, src, err := selectEntry(now, r.URL.Query().Get("id"))
 	if err != nil {
 		http.NotFound(w, r)
 		return
@@ -34,22 +36,76 @@ func handleImage(w http.ResponseWriter, r *http.Request) {
 			src = sequentialSource(entry, true)
 		}
 	}
-	data, ct, err := getImageBytes(src)
-	if err != nil {
-		if entry.OnError == "skip" {
-			http.NotFound(w, r)
+	// Local files are streamed straight from disk (never byte-cached); remote
+	// sources are served from the bounded cache.
+	if isRemote(src) {
+		data, ct, err := getRemoteBytes(src)
+		if err != nil {
+			servePlaceholder(w, r, entry)
 			return
 		}
-		data, ct = placeholderBytes()
+		w.Header().Set("X-Image-ID", entry.ID)
+		w.Header().Set("Cache-Control", "no-cache")
+		if !writeETagged(w, r, data, ct) && r.Method != http.MethodHead {
+			w.Write(data)
+		}
+	} else if err := serveLocalSource(w, r, src, entry); err != nil {
+		servePlaceholder(w, r, entry)
 	}
-	w.Header().Set("X-Image-ID", entry.ID)
-	w.Header().Set("Cache-Control", "no-cache")
-	if writeETagged(w, r, data, ct) {
+	// Bound the serving cache to current + next and warm the next remote
+	// source so the follow-up request is a hit.
+	evictImageCache(entry, src, now)
+	prefetchNext(entry, src, now)
+}
+
+// servePlaceholder writes the on_error outcome for a failing source:
+// 404 when the entry's policy is "skip", the placeholder bytes otherwise.
+func servePlaceholder(w http.ResponseWriter, r *http.Request, entry ImageEntry) {
+	if entry.OnError == "skip" {
+		http.NotFound(w, r)
 		return
 	}
-	if r.Method != http.MethodHead {
+	data, ct := placeholderBytes()
+	w.Header().Set("X-Image-ID", entry.ID)
+	w.Header().Set("Cache-Control", "no-cache")
+	if !writeETagged(w, r, data, ct) && r.Method != http.MethodHead {
 		w.Write(data)
 	}
+}
+
+// serveLocalSource streams a local file from disk without caching its bytes:
+// the ETag derives from mtime+size plus the source identity, so revalidation
+// stays cheap, 304s still work, and distinct sources never share a tag. It
+// returns an error only when the file cannot be opened or stat'd; response
+// errors after that are unrecoverable (headers are sent).
+func serveLocalSource(w http.ResponseWriter, r *http.Request, src string, entry ImageEntry) error {
+	f, err := os.Open(resolveSourcePath(src))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	h := fnv.New32a()
+	h.Write([]byte(src))
+	etag := fmt.Sprintf("\"%x-%x-%x\"", st.ModTime().UnixNano(), st.Size(), h.Sum32())
+	w.Header().Set("Content-Type", contentTypeForFile(f, src))
+	w.Header().Set("ETag", etag)
+	w.Header().Set("X-Image-ID", entry.ID)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if inm := r.Header.Get("If-None-Match"); inm != "" && inm == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return nil
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(st.Size(), 10))
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		io.Copy(w, f)
+	}
+	return nil
 }
 
 // writeETagged sets the entity headers (Content-Type, ETag, nosniff) and

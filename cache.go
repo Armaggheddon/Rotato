@@ -1,7 +1,9 @@
 package main
 
-// Caching & fetching (§6): in-memory byte cache keyed by source, with
-// refresh cadence, stale-on-failure, and a 30s failure cooldown.
+// Caching & fetching (§6): memory-bounded serving. Local files are streamed
+// from disk on every request and never hold bytes in memory; remote sources
+// keep at most the current + next source cached (evicted after each request),
+// with refresh cadence, stale-on-failure, and a 30s failure cooldown.
 
 import (
 	"errors"
@@ -24,6 +26,8 @@ var placeholderGIF = []byte{
 }
 
 // cacheEntry is one source's cached bytes plus fetch bookkeeping.
+// Entries with data are remote-only; local sources are never byte-cached.
+// errAt-only entries (a failed fetch) are kept for the failure cooldown.
 type cacheEntry struct {
 	data        []byte
 	contentType string
@@ -31,17 +35,16 @@ type cacheEntry struct {
 	errAt       time.Time
 }
 
-func getImageBytes(src string) ([]byte, string, error) {
-	if isRemote(src) {
-		return remoteBytes(src, imageCache, imageCachePut)
-	}
-	return localBytes(src, imageCache, imageCachePut)
+// getRemoteBytes serves one remote source through the serving cache.
+func getRemoteBytes(src string) ([]byte, string, error) {
+	return remoteBytes(src, imageCache, imageCachePut)
 }
 
 // placeholderBytes resolves the error placeholder (§6): the configured
-// `placeholder:` source served through the normal image cache, or the
-// built-in 1x1 transparent GIF when no placeholder is configured or the
-// configured one cannot be fetched.
+// `placeholder:` source served through the normal cache, or the built-in 1x1
+// transparent GIF when no placeholder is configured or the configured one
+// cannot be fetched. A remote placeholder goes through the serving cache; a
+// local one is read directly (placeholders are small).
 func placeholderBytes() ([]byte, string) {
 	mu.RLock()
 	p := ""
@@ -50,8 +53,12 @@ func placeholderBytes() ([]byte, string) {
 	}
 	mu.RUnlock()
 	if p != "" {
-		if data, ct, err := getImageBytes(p); err == nil {
-			return data, ct
+		if isRemote(p) {
+			if data, ct, err := getRemoteBytes(p); err == nil {
+				return data, ct
+			}
+		} else if data, err := os.ReadFile(resolveSourcePath(p)); err == nil {
+			return data, contentTypeForPath(p, data)
 		}
 	}
 	return placeholderGIF, "image/gif"
@@ -75,9 +82,10 @@ func previewCached(src string) ([]byte, string, error) {
 	return localBytes(src, previewCache, previewCachePut)
 }
 
-// localBytes serves a local file through the given cache: read on first
+// localBytes serves a local file through the preview cache: read on first
 // access, cached until the next config reload (refreshCache drops local
-// entries so they re-read), with a 30s failure cooldown.
+// preview entries so they re-read), with a 30s failure cooldown. The serving
+// path never caches local bytes — it streams from disk instead.
 func localBytes(src string, cache map[string]cacheEntry, put func(string, cacheEntry)) ([]byte, string, error) {
 	now := time.Now().UTC()
 	mu.RLock()
@@ -99,6 +107,72 @@ func localBytes(src string, cache map[string]cacheEntry, put func(string, cacheE
 	ct := contentTypeForPath(src, data)
 	put(src, cacheEntry{data: data, contentType: ct, fetchedAt: now})
 	return data, ct, nil
+}
+
+// probeSource reports whether src can currently be served, used by the
+// on_error:"skip" pre-check. Remote sources fetch into the serving cache
+// (eviction cleans up if the entry is not served); local files are stat'd,
+// never read in full just to check existence.
+func probeSource(src string) error {
+	if isRemote(src) {
+		_, _, err := getRemoteBytes(src)
+		return err
+	}
+	_, err := os.Stat(resolveSourcePath(src))
+	return err
+}
+
+// nextSource returns the source e will serve after cur (rotation-aware), or
+// "" for a single-source entry. It drives the serving-cache bound and the
+// prefetch.
+func nextSource(e ImageEntry, now time.Time) string {
+	n := len(e.Sources)
+	if n == 0 {
+		return ""
+	}
+	if e.Rotation.Type == "sequential" {
+		// after an advancing GET the cursor already points at the next source
+		return e.Sources[int(sequentialCursor(e)%int64(n))]
+	}
+	if e.Rotation.Every > 0 {
+		step := int64(e.Rotation.Every)
+		t := time.Unix(now.Unix()/step*step+step, 0).UTC() // next boundary
+		return currentSource(e, t)
+	}
+	return e.Sources[0]
+}
+
+// evictImageCache bounds the serving cache: after each request only the
+// current and next remote sources keep their bytes; any other byte entries
+// are dropped. errAt-only markers are kept for the failure cooldown.
+func evictImageCache(entry ImageEntry, cur string, now time.Time) {
+	keep := map[string]bool{cur: true}
+	if nx := nextSource(entry, now); nx != "" && isRemote(nx) {
+		keep[nx] = true
+	}
+	mu.Lock()
+	for src, e := range imageCache {
+		if len(e.data) > 0 && !keep[src] {
+			delete(imageCache, src)
+		}
+	}
+	mu.Unlock()
+}
+
+// prefetchNext warms the remote source the next request will serve, so the
+// follow-up request is a cache hit. Best-effort and non-blocking.
+func prefetchNext(entry ImageEntry, cur string, now time.Time) {
+	nx := nextSource(entry, now)
+	if nx == "" || !isRemote(nx) || nx == cur {
+		return
+	}
+	mu.RLock()
+	c, ok := imageCache[nx]
+	mu.RUnlock()
+	if ok && (len(c.data) > 0 || now.Sub(c.errAt) < 30*time.Second) {
+		return
+	}
+	go getRemoteBytes(nx) // best-effort; evicted later if never served
 }
 
 // remoteBytes serves a remote URL through the given cache: re-fetches when
@@ -232,10 +306,10 @@ func fetch(src string) ([]byte, string, error) {
 	return data, ct, nil
 }
 
-// refreshCache runs after a successful config reload: drops entries whose
-// source is no longer referenced and invalidates local-file entries so they
-// are re-read on the next access (§6, §9). Preview entries get the same
-// treatment: local files re-read, remote sources keep their bytes.
+// refreshCache runs after a successful config reload: drops serving entries
+// whose source is no longer referenced (local sources are never byte-cached,
+// so there is nothing else to invalidate) and drops local-file preview
+// entries so they re-read (§6, §9).
 func refreshCache(c *Config) {
 	refd := make(map[string]bool)
 	for i := range c.Images {
@@ -248,7 +322,7 @@ func refreshCache(c *Config) {
 	}
 	mu.Lock()
 	for src := range imageCache {
-		if !refd[src] || !isRemote(src) {
+		if !refd[src] {
 			delete(imageCache, src)
 		}
 	}
@@ -285,16 +359,31 @@ func resolveSourcePath(src string) string {
 	return filepath.Join(dataRoot, src)
 }
 
+var extContentType = map[string]string{
+	".png":  "image/png",
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".gif":  "image/gif",
+	".webp": "image/webp",
+}
+
+// contentTypeForPath maps a path's extension to an image Content-Type,
+// sniffing data when the extension is unknown or absent.
 func contentTypeForPath(p string, data []byte) string {
-	switch strings.ToLower(filepath.Ext(p)) {
-	case ".png":
-		return "image/png"
-	case ".jpg", ".jpeg":
-		return "image/jpeg"
-	case ".gif":
-		return "image/gif"
-	case ".webp":
-		return "image/webp"
+	if ct, ok := extContentType[strings.ToLower(filepath.Ext(p))]; ok {
+		return ct
 	}
 	return http.DetectContentType(data)
+}
+
+// contentTypeForFile resolves the Content-Type of an open file by extension,
+// sniffing the first 512 bytes (and rewinding) when the extension is unknown.
+func contentTypeForFile(f *os.File, src string) string {
+	if ct, ok := extContentType[strings.ToLower(filepath.Ext(src))]; ok {
+		return ct
+	}
+	var buf [512]byte
+	n, _ := f.Read(buf[:])
+	f.Seek(0, io.SeekStart)
+	return http.DetectContentType(buf[:n])
 }

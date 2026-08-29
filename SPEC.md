@@ -304,35 +304,51 @@ advancing, so previewing never skips an image.
 
 ## 6. Caching & fetching
 
-- In-memory cache: `map[source]cacheEntry` where
-  `cacheEntry = {data []byte, contentType string, fetchedAt time.Time, errAt time.Time}`,
-  protected by a `sync.RWMutex`.
-- **Local files**: read on first access; cached until the next config reload
-  (re-read on reload — picks up file changes; bytes cost nothing).
+Memory-bounded serving: **local files are never byte-cached** (streamed from
+disk per request), and **remote sources keep at most the current + next
+source's bytes** at any time. All entries live in `map[source]cacheEntry`
+where `cacheEntry = {data, contentType, fetchedAt, errAt}`, guarded by a
+`sync.RWMutex`; `errAt`-only markers (a failed fetch) are cheap and kept for
+the cooldown.
+
+- **Local files**: streamed from disk on every request (`os.Open` + `io.Copy`,
+  `Content-Length` from stat). The ETag derives from `mtime+size`, so
+  `If-None-Match` revalidation stays cheap and returns 304s without hashing
+  large files. Nothing is held in memory; edits on disk are picked up
+  immediately.
 - **Remote URLs**: fetched on first access with `timeout` (default 10s).
   Re-fetched when `now - fetchedAt >= refresh` (per-entry or global default, 1h).
   `refresh: never` = fetch once, cache forever.
+- **Current + next bound**: after each `/image` request the serving cache is
+  evicted down to the current source and the next one in rotation order
+  (`evictImageCache`); the next remote source is then pre-fetched
+  best-effort in the background (`prefetchNext`), so the follow-up request is
+  a cache hit. Memory therefore stays at ≤ 2 remote images regardless of the
+  config's size, plus the Go runtime baseline.
 - **Stale-on-failure**: if a refresh fetch fails but the cache still holds bytes,
   serve the stale bytes (better than a placeholder for cameras). Failure handling
   (`on_error`) only applies when the cache has no bytes for the source.
 - **Failure cooldown**: a failed fetch is remembered for 30s (`errAt`); requests
   within the cooldown do not re-attempt — this prevents a 10s-timeout pile-up on a
-  dead source.
+  dead source. The `on_error: skip` pre-check probes remote sources through the
+  cache and local sources with a cheap `stat` (never a full read).
 - **Placeholder**: the configured `placeholder:` source is fetched through
-  the normal cache (global `refresh` cadence); on failure — or when no
-  placeholder is configured — the hard-coded 1×1 transparent GIF is served
-  as `image/gif`.
+  the normal cache (global `refresh` cadence) when remote, or read directly
+  when local; on failure — or when no placeholder is configured — the
+  hard-coded 1×1 transparent GIF is served as `image/gif`.
 - **Preview cache** (`/api/preview`): a separate bounded map (max 64 entries,
   oldest evicted first) so previews never pollute the serving cache. Remote
   previews follow the same refresh/stale-on-failure/cooldown rules as the
-  serving cache; local previews re-read after each config reload (the
-  preview cache is cleared wholesale on reload).
-- **Eviction**: on a successful config reload, drop cache entries whose source
-  is no longer referenced by the new config (bounds memory across edits).
+  serving cache; local previews are dropped on each config reload so they
+  re-read. This is what keeps the admin UI's carousel GIFs looping across
+  polls.
+- **Eviction on reload**: a successful config reload drops serving-cache
+  entries whose source is no longer referenced (local sources hold no bytes,
+  so nothing else needs invalidating) and drops local preview entries.
 - **Content-Type**: for local files, map by extension (`.png .jpg .jpeg .gif
-  .webp`); otherwise `http.DetectContentType`. For remote responses, use the
-  response `Content-Type` header when it is `image/*`, else sniff. Supported
-  formats: PNG, JPEG, GIF, WebP.
+  .webp`); otherwise sniff `http.DetectContentType` (first 512 bytes when
+  streaming). For remote responses, use the response `Content-Type` header
+  when it is `image/*`, else sniff. Supported formats: PNG, JPEG, GIF, WebP.
 
 ## 7. HTTP API
 

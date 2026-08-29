@@ -4,7 +4,7 @@ package main
 // currentSource, and selectEntry. Timestamps are fixed UTC instants (daily
 // windows are date-agnostic, so the 1970-01-01 epoch is fine). Most cases are
 // I/O-free — sources are plain paths that are never fetched, because
-// selectEntry only calls getImageBytes for candidates with on_error:"skip".
+// selectEntry only probes sources for candidates with on_error:"skip".
 // The one I/O-touching path (skip fallback) lives in TestSelectEntrySkipFallback,
 // which uses t.TempDir() files and keeps every source path unique per subtest.
 

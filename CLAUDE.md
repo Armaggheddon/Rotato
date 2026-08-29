@@ -55,6 +55,11 @@ gunzip -c rotato-arm64.tar.gz | docker load && docker compose up -d
   optional `dates: ["DD-MM"]` limits it to those calendar days) |
   `sequential` (advance one source per GET, wrap around; in-memory cursor).
 - `refresh` (default 1h) re-fetches remote sources; `on_error: skip | placeholder`.
+  Serving is memory-bounded: local files are streamed from disk (never
+  byte-cached; ETag from mtime+size), remote sources keep only the current +
+  next image (`evictImageCache` after each serve, `prefetchNext` warms the
+  next), errAt-only markers keep the 30s failure cooldown. The preview cache
+  is separate and bounded at 64 entries.
   Global `placeholder:` (path or http(s) URL) is the error placeholder; it
   falls back to the built-in 1×1 transparent GIF when unset or unloadable.
 - Selection logic lives in small pure functions (`entryActive`, `currentSource`,

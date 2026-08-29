@@ -213,10 +213,11 @@ func loadConfig(path string) error {
 	}
 	mu.Unlock()
 	refreshCache(c)
-	// Pre-warm the winning source so the first request is fast; a failure here
-	// is tolerated (it just populates the fetch-error cooldown).
-	if e, src, err := selectEntry(time.Now().UTC(), ""); err == nil && e.ID != "" {
-		getImageBytes(src)
+	// Pre-warm a remote winning source so the first request is fast; local
+	// sources are streamed on demand. A failure here is tolerated (it just
+	// populates the fetch-error cooldown).
+	if e, src, err := selectEntry(time.Now().UTC(), ""); err == nil && e.ID != "" && isRemote(src) {
+		getRemoteBytes(src)
 	}
 	return nil
 }

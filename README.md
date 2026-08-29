@@ -74,9 +74,10 @@ UI at `http://<host>:8080/admin` to edit the config.
 - The container clock is UTC, but `at`/`until`/`dates` are interpreted in the
   timezone set by `tz:` (default: the `TZ` env var, else UTC). Interval cycles
   are epoch-aligned and timezone-independent.
-- Remote sources are cached in memory and re-fetched on the `refresh` cadence;
-  a failed refresh keeps serving the stale bytes. If no entry is active at all,
-  `/image` returns `404`.
+- Memory-bounded: local files are streamed from disk (never cached), remote
+  sources keep only the current + next image cached, and a failed refresh
+  keeps serving the stale bytes. If no entry is active at all, `/image`
+  returns `404`.
 
 ## Configuration
 

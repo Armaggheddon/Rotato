@@ -63,6 +63,53 @@ func TestSequentialTwoRequests(t *testing.T) {
 	}
 }
 
+// TestLocalStreamingETag covers the streamed local-file path (§6): the ETag is
+// derived from mtime+size, so a second request for the same source with
+// If-None-Match gets a 304 without hashing the bytes.
+func TestLocalStreamingETag(t *testing.T) {
+	dir := t.TempDir()
+	setDataRoot(t, dir)
+	f := filepath.Join(dir, "a.gif")
+	if err := os.WriteFile(f, []byte("GIF89a local bytes"), 0o644); err != nil {
+		t.Fatalf("os.WriteFile: %v", err)
+	}
+	setConfig(t, &Config{Images: []ImageEntry{
+		{ID: "static", Sources: []string{"a.gif"}},
+	}})
+
+	get := func(inm string) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/image", nil)
+		if inm != "" {
+			req.Header.Set("If-None-Match", inm)
+		}
+		handleImage(rr, req)
+		return rr
+	}
+	rr := get("")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "image/gif" {
+		t.Errorf("Content-Type = %q, want image/gif", ct)
+	}
+	etag := rr.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("missing ETag")
+	}
+	if body := rr.Body.String(); body != "GIF89a local bytes" {
+		t.Errorf("body = %q, want the file bytes", body)
+	}
+
+	rr = get(etag)
+	if rr.Code != http.StatusNotModified {
+		t.Errorf("If-None-Match: status = %d, want 304", rr.Code)
+	}
+	if rr.Body.Len() != 0 {
+		t.Errorf("304 body = %q, want empty", rr.Body.String())
+	}
+}
+
 // TestHandleAPIStatusTimeline checks the /api/status JSON: the nested
 // `timeline` (carousel slots, the next-change schedule, per-entry rows) and
 // the theme shape.
