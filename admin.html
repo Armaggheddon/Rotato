@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rotato Admin</title>
+<link rel="icon" href="/favicon.svg">
+<style>
+  /* ----------------------------------------------------------------------
+     Terminal-TUI look & feel (inspired by terminal.css, self-contained —
+     no CDN assets). The base colors are configured in config.yaml:
+
+       theme:
+         mode: auto            # auto | dark | light
+         dark:                 # palette for the dark scheme
+           background: "#1a170f"
+           foreground: "#eceae5"
+           accent:     "#2a9336"
+         light:                # palette for the light scheme
+           background: "#f5f3ee"
+           foreground: "#1f1d17"
+           accent:     "#1f7a2e"
+
+     The effective palettes are applied at runtime from /api/status; the
+     values below are just the built-in defaults. Derived shades (panels,
+     borders, dim text) are computed with color-mix() from the base three.
+     ---------------------------------------------------------------------- */
+  :root {
+    --bg: var(--theme-bg, #1a170f);
+    --fg: var(--theme-fg, #eceae5);
+    --accent: var(--theme-ac, #2a9336);
+    --panel: color-mix(in srgb, var(--fg) 7%, var(--bg));
+    --inset: color-mix(in srgb, var(--fg) 11%, var(--bg));
+    --border: color-mix(in srgb, var(--fg) 32%, var(--bg));
+    --dim: color-mix(in srgb, var(--fg) 55%, var(--bg));
+    --ok: var(--accent);
+    --err: #e5484d;
+    --radius: 0;
+    --font-size: 13px;
+    --line-height: 1.54em;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 18px 20px 48px;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: "Fira Code", "JetBrains Mono", ui-monospace, SFMono-Regular,
+      Monaco, Consolas, "Ubuntu Mono", "Liberation Mono", monospace;
+    font-size: var(--font-size);
+    font-weight: 400;
+    line-height: var(--line-height);
+    font-variant-ligatures: contextual;
+  }
+  img { display: block; }
+  a { color: var(--accent); }
+  ::selection { background: color-mix(in srgb, var(--accent) 45%, transparent); }
+
+  header {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 14px; flex-wrap: wrap;
+  }
+  h1 { font-size: calc(var(--font-size) * 1.4); letter-spacing: 0.05em; font-weight: 600; }
+  h1::before { content: "\27F3  "; color: var(--accent); }
+  h1::after { content: "_"; color: var(--accent); animation: blink 1.2s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .grow { flex: 1; }
+  .muted { color: var(--dim); font-size: 12px; }
+
+  /* ---------------- controls ---------------- */
+  button {
+    position: relative;
+    font: inherit; font-weight: 600;
+    text-decoration: none; text-align: center;
+    background: transparent; color: var(--accent);
+    padding: 4px 16px;
+    border: 2px solid var(--accent);
+    border-radius: var(--radius);
+    transition: background 0.15s linear;
+    appearance: none; cursor: pointer; outline: none;
+    text-transform: uppercase; letter-spacing: 0.08em; font-size: 12px;
+  }
+  button:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+  button:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+  button:disabled { opacity: 0.4; cursor: default; }
+
+  input, textarea {
+    width: 100%;
+    background: transparent; color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 6px 9px;
+    font: inherit; font-size: 12px;
+    appearance: none;
+  }
+  input:focus-visible, input:active,
+  textarea:focus-visible, textarea:active {
+    border-color: var(--accent);
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .banner {
+    display: flex; gap: 8px; align-items: baseline;
+    border: 1px solid var(--err);
+    color: var(--err);
+    background: color-mix(in srgb, var(--err) 12%, transparent);
+    padding: 7px 12px; margin-bottom: 14px;
+    overflow-wrap: anywhere;
+  }
+  .banner[hidden] { display: none; }
+
+  /* ---------------- carousel: slanted, slightly overlapped ---------------- */
+  .carousel {
+    display: grid;
+    grid-template-columns: 1fr 1.7fr 1fr;
+    align-items: center;
+  }
+  .slot { min-width: 0; position: relative; }
+  .slot.prev { z-index: 1; margin-right: -30px; }
+  .slot.next { z-index: 1; margin-left: -30px; }
+  .slot.current { z-index: 2; }
+  .slot .frame {
+    position: relative;
+    overflow: hidden;
+    background: var(--inset);
+    border: 2px solid var(--border);
+    transform: skewX(-8deg);
+  }
+  .slot.current .frame { border-color: var(--accent); }
+  .slot .frame > .unskew {
+    transform: skewX(8deg);
+    width: 118%;
+    margin-left: -9%;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .slot img { width: 100%; height: 100%; object-fit: cover; }
+  .slot.prev .frame, .slot.next .frame { height: 150px; }
+  .slot.current .frame { height: 250px; }
+  .slot.prev img, .slot.next img { filter: blur(2px) brightness(0.55); }
+  .slot .empty-state {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--dim);
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em;
+    border: 1px dashed var(--border);
+    transform: skewX(8deg);
+  }
+  .checkmark {
+    position: absolute; top: 8px; right: 16px; z-index: 2;
+    background: var(--accent); color: var(--bg);
+    font-weight: 700; font-size: 14px; line-height: 1;
+    padding: 5px 8px 6px;
+    transform: skewX(8deg);
+  }
+  .slot-label {
+    margin-top: 8px;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.18em;
+    color: var(--dim); text-align: center;
+  }
+  .slot-label b { color: var(--fg); }
+
+  /* ---------------- timeline: hairline markers ---------------- */
+  .timeline {
+    display: grid;
+    grid-template-columns: 1fr 1.7fr 1fr;
+    gap: 12px;
+    margin: 20px 0 14px;
+  }
+  .tmark {
+    position: relative;
+    border-left: 2px solid var(--border);
+    padding: 1px 0 7px 14px;
+    min-height: 54px;
+  }
+  .tmark.winner { border-left-color: var(--accent); }
+  .tmark::before {
+    content: "";
+    position: absolute; left: -5px; top: 2px;
+    width: 8px; height: 8px;
+    background: var(--bg);
+    border: 2px solid var(--border);
+  }
+  .tmark.winner::before { background: var(--accent); border-color: var(--accent); }
+  .tmark .tlabel {
+    display: block;
+    color: var(--dim);
+    text-transform: uppercase; letter-spacing: 0.16em;
+    font-size: 9px; margin-bottom: 2px;
+  }
+  .tmark .cond { font-size: 11px; }
+  .tmark .countdown { display: block; color: var(--accent); font-weight: 600; font-size: 11px; margin-top: 1px; }
+  .tmark .src { display: block; color: var(--dim); font-size: 10px; margin-top: 1px; overflow-wrap: anywhere; }
+
+  .entries-strip { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }
+  .chip {
+    border: 1px solid var(--border);
+    padding: 2px 10px;
+    font-size: 11px; color: var(--dim);
+  }
+  .chip.winner { border-color: var(--accent); color: var(--fg); }
+  .chip.winner::before { content: "\25CF  "; color: var(--accent); }
+
+  /* ---------------- panels ---------------- */
+  .panel {
+    border: 1px solid var(--border);
+    background: var(--panel);
+    padding: 12px 14px;
+    margin-bottom: 14px;
+  }
+  .panel h2 {
+    margin: 0 0 10px;
+    font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.16em;
+    color: var(--accent);
+  }
+  .panel h2::before { content: "\25B8  "; }
+
+  .actions { display: flex; align-items: center; gap: 14px; margin-top: 4px; flex-wrap: wrap; }
+  .status { min-height: 1.4em; font-size: 12px; }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--err); }
+  .status.dim { color: var(--dim); }
+
+  /* ---------------- editor: gutter (line numbers) ---------------- */
+  .editor {
+    display: flex;
+    border: 1px solid var(--border);
+    background: var(--inset);
+    height: 46vh;
+  }
+  .editor:focus-within { border-color: var(--accent); outline: 1px solid var(--accent); outline-offset: 1px; }
+
+  .gutter {
+    flex: 0 0 auto;
+    height: 100%;
+    overflow: hidden;
+    padding: 10px 6px 10px 0;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    user-select: none;
+    font-size: 12px;
+    line-height: var(--line-height);
+  }
+  .gutter .row {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 5px;
+    height: var(--line-height);
+  }
+  .gutter .ln { min-width: 24px; text-align: right; color: var(--dim); }
+
+  /* ✕ badge for failed previews (carousel frames) */
+  .broken {
+    position: absolute;
+    top: 3px; right: 3px;
+    background: var(--err);
+    color: var(--bg);
+    font-size: 9px; line-height: 1;
+    padding: 3px 4px;
+    z-index: 3;
+  }
+
+  #config {
+    flex: 1;
+    height: 100%;
+    border: none;
+    resize: none;
+    padding: 10px 12px;
+    font: inherit;
+    font-size: 12px;
+    line-height: var(--line-height);
+    white-space: pre;
+    overflow: auto;
+    tab-size: 2;
+  }
+  #config:focus { outline: none; }
+
+  footer { margin-top: 22px; color: var(--dim); font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>rotato admin</h1>
+  <span class="muted" id="tz-label">—</span>
+  <span class="grow"></span>
+</header>
+
+<div class="banner" id="error-banner" hidden><span>!</span><span id="error-text"></span></div>
+
+<!-- ================= carousel + timeline ================= -->
+<div class="carousel">
+  <div class="slot prev" id="slot-prev">
+    <div class="frame">
+      <div class="unskew"><img id="img-prev" alt="previous" hidden></div>
+    </div>
+    <div class="slot-label" id="label-prev">prev</div>
+  </div>
+  <div class="slot current" id="slot-current">
+    <div class="frame">
+      <div class="unskew"><img id="img-current" alt="current" hidden></div>
+      <div class="checkmark">&#10003;</div>
+    </div>
+    <div class="slot-label" id="label-current">now</div>
+  </div>
+  <div class="slot next" id="slot-next">
+    <div class="frame">
+      <div class="unskew"><img id="img-next" alt="next" hidden></div>
+    </div>
+    <div class="slot-label" id="label-next">next</div>
+  </div>
+</div>
+
+<div class="timeline">
+  <div class="tmark" id="tm-prev"><span class="tlabel">previous</span><span class="cond">—</span></div>
+  <div class="tmark" id="tm-current"><span class="tlabel">now serving</span><span class="cond">—</span></div>
+  <div class="tmark" id="tm-next"><span class="tlabel">next</span><span class="cond">—</span><span class="countdown"></span></div>
+</div>
+
+<div class="entries-strip" id="entries-strip"></div>
+
+<!-- ================= config editor ================= -->
+<div class="panel">
+  <h2>config.yaml</h2>
+  <div class="editor">
+    <div class="gutter" id="gutter" aria-hidden="true"></div>
+    <textarea id="config" spellcheck="false" autocomplete="off" autocapitalize="off" wrap="off"></textarea>
+  </div>
+  <div class="actions">
+    <span class="status" id="status" role="status"></span>
+    <span class="grow"></span>
+    <button id="save" type="button">Save</button>
+  </div>
+</div>
+
+<footer id="footer">—</footer>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+/* ---------------- preview blob cache ---------------- */
+// One objectURL per source, shared by the carousel slots: unchanged sources
+// never re-fetch, so GIFs keep looping across polls. The server answers
+// revalidation with 304s.
+
+const previewCache = new Map(); // src -> {url, etag, status, fetchAt, promise, imgs, retryTimer}
+
+function ensurePreview(src) {
+  let ent = previewCache.get(src);
+  if (!ent) {
+    ent = { url: "", etag: "", status: "loading", fetchAt: 0, promise: null, imgs: new Set(), retryTimer: null };
+    previewCache.set(src, ent);
+  }
+  if (ent.promise) return;
+  ent.status = "loading";
+  ent.fetchAt = Date.now();
+  ent.promise = fetch("/api/preview?src=" + encodeURIComponent(src), {
+    headers: ent.etag ? { "If-None-Match": ent.etag } : {}
+  }).then(async (r) => {
+    if (r.status === 304 && ent.url) {
+      ent.status = "ok"; // bytes unchanged: keep the existing objectURL
+    } else if (r.ok) {
+      const blob = await r.blob();
+      if (ent.url) URL.revokeObjectURL(ent.url);
+      ent.url = URL.createObjectURL(blob);
+      ent.etag = r.headers.get("ETag") || "";
+      ent.status = "ok";
+    } else {
+      ent.status = "err";
+      scheduleRetry(src, ent);
+    }
+    ent.promise = null;
+    notifyPreview(src, ent);
+  }).catch(() => {
+    ent.status = "err";
+    ent.promise = null;
+    scheduleRetry(src, ent);
+    notifyPreview(src, ent);
+  });
+}
+
+// Retry failed previews every 20s as long as something still shows them.
+function scheduleRetry(src, ent) {
+  if (ent.retryTimer) return;
+  ent.retryTimer = setTimeout(() => {
+    ent.retryTimer = null;
+    if (ent.status === "err" && ent.imgs && ent.imgs.size > 0) ensurePreview(src);
+  }, 20000);
+}
+
+function previewFor(src) {
+  let ent = previewCache.get(src);
+  if (!ent) {
+    ensurePreview(src);
+    return previewCache.get(src);
+  }
+  if ((ent.status === "err" && Date.now() - ent.fetchAt >= 20000) || ent.status === "loading") {
+    ensurePreview(src);
+  }
+  return ent;
+}
+
+// applyEnt renders the entry's current state into img (inside the carousel
+// frame it lives in). Broken sources get a ✕ badge; loading hides the img.
+function applyEnt(img, src, ent) {
+  const slot = img.closest(".frame");
+  if (ent.status === "ok" && ent.url) {
+    if (img.src !== ent.url) img.src = ent.url;
+    img.hidden = false;
+    const b = slot && slot.querySelector(".broken");
+    if (b) b.remove();
+  } else if (ent.status === "err") {
+    img.hidden = true;
+    if (slot && !slot.querySelector(".broken")) {
+      const b = document.createElement("div");
+      b.className = "broken";
+      b.textContent = "\u2715";
+      b.title = "preview failed: " + src;
+      slot.appendChild(b);
+    }
+  } else {
+    img.hidden = true;
+  }
+}
+
+function notifyPreview(src, ent) {
+  if (ent.imgs) for (const img of ent.imgs) applyEnt(img, src, ent);
+}
+
+// attach binds img to src (replacing any previous binding).
+function attach(img, src) {
+  detach(img);
+  img.dataset.src = src;
+  const ent = previewFor(src);
+  ent.imgs.add(img);
+  applyEnt(img, src, ent);
+}
+
+function detach(img) {
+  const src = img.dataset.src;
+  if (src) {
+    const ent = previewCache.get(src);
+    if (ent && ent.imgs) ent.imgs.delete(img);
+  }
+  img.dataset.src = "";
+  img.removeAttribute("src");
+  img.hidden = true;
+}
+
+// setSlotImg drives one carousel slot: unchanged sources keep their img
+// untouched (GIFs loop), empty sources show the dashed placeholder.
+function setSlotImg(img, src, emptyText) {
+  const frame = img.closest(".frame");
+  if (!src) {
+    detach(img);
+    let ph = frame.querySelector(".empty-state");
+    if (!ph) {
+      ph = document.createElement("div");
+      ph.className = "empty-state";
+      frame.appendChild(ph);
+    }
+    ph.textContent = emptyText || "empty";
+    return;
+  }
+  const ph = frame.querySelector(".empty-state");
+  if (ph) ph.remove();
+  if (img.dataset.src === src) return;
+  attach(img, src);
+}
+
+// dropLocalPreviews forgets local-file previews after a config reload (their
+// bytes may have changed on disk); remote previews stay (ETag revalidates).
+function dropLocalPreviews() {
+  for (const [src, ent] of previewCache) {
+    if (/^https?:\/\//i.test(src)) continue;
+    if (ent.url) URL.revokeObjectURL(ent.url);
+    if (ent.retryTimer) { clearTimeout(ent.retryTimer); ent.retryTimer = null; }
+    previewCache.delete(src);
+  }
+  if (state.lastTimeline) renderTimeline(state.lastTimeline);
+}
+
+/* ---------------- theme ---------------- */
+
+const state = { dirty: false, theme: null, lastTimeline: null, lastMtime: "" };
+
+// The server fills in effective palettes (config + built-in defaults), so
+// applyTheme just picks dark vs light by mode; "auto" follows the OS scheme.
+function applyTheme() {
+  const th = state.theme;
+  if (!th) return;
+  const dark = th.mode === "dark" || (th.mode !== "light" && darkQuery.matches);
+  const p = dark ? th.dark : th.light;
+  const r = document.documentElement.style;
+  r.setProperty("--theme-bg", p.background);
+  r.setProperty("--theme-fg", p.foreground);
+  r.setProperty("--theme-ac", p.accent);
+}
+darkQuery.addEventListener("change", applyTheme);
+
+/* ---------------- carousel + timeline rendering ---------------- */
+
+function fmtCountdown(secs) {
+  secs = Math.max(0, Math.floor(secs));
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+  if (h > 0) return "in " + h + "h " + String(m).padStart(2, "0") + "m";
+  if (m > 0) return "in " + m + "m " + String(s).padStart(2, "0") + "s";
+  return "in " + s + "s";
+}
+
+function renderTimeline(tl) {
+  tl = tl || {};
+  state.lastTimeline = tl;
+  // All three slots render their EXACT sources through the preview cache.
+  // The timeline's sequential slots already account for the in-memory cursor.
+  const src = (slot) => (slot && slot.source ? slot.source : "");
+  setSlotImg($("img-current"), src(tl.current), "no active entry");
+  setSlotImg($("img-prev"), src(tl.prev), "no prev");
+  setSlotImg($("img-next"), src(tl.next), "no next");
+
+  $("label-prev").innerHTML = tl.prev && tl.prev.entry_id ? "prev &middot; <b>" + tl.prev.entry_id + "</b>" : "prev &middot; &mdash;";
+  $("label-current").innerHTML = tl.current && tl.current.entry_id ? "now &middot; <b>" + tl.current.entry_id + "</b>" : "now &middot; &mdash;";
+  $("label-next").innerHTML = tl.next && tl.next.entry_id ? "next &middot; <b>" + tl.next.entry_id + "</b>" : "next &middot; &mdash;";
+
+  const cell = (id, slot, isWinner) => {
+    const el = $(id);
+    el.classList.toggle("winner", !!isWinner);
+    const cond = slot && slot.condition ? slot.condition : "—";
+    const s = slot && slot.source ? slot.source : "";
+    el.querySelector(".cond").textContent = cond;
+    let srcEl = el.querySelector(".src");
+    if (s) {
+      if (!srcEl) {
+        srcEl = document.createElement("span");
+        srcEl.className = "src";
+        el.appendChild(srcEl);
+      }
+      srcEl.textContent = s;
+    } else if (srcEl) {
+      srcEl.remove();
+    }
+  };
+  cell("tm-prev", tl.prev, false);
+  cell("tm-current", tl.current, true);
+  cell("tm-next", tl.next, false);
+
+  const cd = $("tm-next").querySelector(".countdown");
+  if (tl.next_change) {
+    cd.dataset.at = tl.next_change.at;
+    cd.textContent = fmtCountdown((Date.parse(tl.next_change.at) - Date.now()) / 1000);
+  } else {
+    cd.dataset.at = "";
+    cd.textContent = "no scheduled change";
+  }
+
+  const strip = $("entries-strip");
+  strip.innerHTML = "";
+  for (const e of tl.entries || []) {
+    const chip = document.createElement("span");
+    chip.className = "chip" + (e.is_winner ? " winner" : "");
+    chip.textContent = e.id + " · " + e.condition;
+    if (!e.active) chip.style.opacity = "0.45";
+    strip.appendChild(chip);
+  }
+}
+
+setInterval(() => {
+  const cd = $("tm-next") && $("tm-next").querySelector(".countdown");
+  if (cd && cd.dataset.at) {
+    cd.textContent = fmtCountdown((Date.parse(cd.dataset.at) - Date.now()) / 1000);
+  }
+}, 1000);
+
+/* ---------------- gutter: line numbers ---------------- */
+
+function syncGutterScroll() {
+  $("gutter").scrollTop = $("config").scrollTop;
+}
+
+// Keeps the row count in lockstep with the textarea on every keystroke
+// (line numbers stay exact). Also handles full text replacements.
+function syncGutterCount() {
+  const gutter = $("gutter");
+  const want = $("config").value.split("\n").length;
+  while (gutter.children.length < want) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const ln = document.createElement("span");
+    ln.className = "ln";
+    ln.textContent = gutter.children.length + 1;
+    row.appendChild(ln);
+    gutter.appendChild(row);
+  }
+  while (gutter.children.length > want) gutter.removeChild(gutter.lastChild);
+  syncGutterScroll();
+}
+
+/* ---------------- editor wiring ---------------- */
+
+$("config").addEventListener("input", () => {
+  markDirty();
+  syncGutterCount();
+});
+$("config").addEventListener("scroll", syncGutterScroll);
+$("config").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) doSave();
+  else if (e.key === "Tab") {
+    e.preventDefault();
+    const ta = $("config");
+    const start = ta.selectionStart, end = ta.selectionEnd;
+    ta.setRangeText("  ", start, end, "end");
+    markDirty();
+    syncGutterCount();
+  }
+});
+
+function flash(msg, cls) {
+  const el = $("status");
+  el.textContent = msg;
+  el.className = "status " + cls;
+}
+
+function markDirty() {
+  state.dirty = true;
+  flash("unsaved changes", "dim");
+  scheduleValidate();
+}
+
+/* ---------------- live validation ---------------- */
+
+let validateTimer = null;
+function scheduleValidate() {
+  clearTimeout(validateTimer);
+  validateTimer = setTimeout(validateNow, 700);
+}
+
+async function validateNow() {
+  const text = $("config").value;
+  try {
+    const r = await fetch("/api/config/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-yaml" },
+      body: text
+    });
+    const body = await r.text();
+    if (r.ok) {
+      if (state.dirty) flash("valid \u2713 \u2014 save to apply", "ok");
+    } else {
+      flash("validation: " + (body || "(error)"), "err");
+    }
+  } catch (e) {
+    flash("validate failed: " + e.message, "err");
+  }
+}
+
+/* ---------------- save ---------------- */
+
+async function doSave() {
+  const text = $("config").value;
+  const btn = $("save");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-yaml" },
+      body: text
+    });
+    const body = await r.text();
+    if (!r.ok) {
+      throw new Error((r.status === 400 ? "validation: " : "save failed (HTTP " + r.status + "): ") + (body || "(empty body)"));
+    }
+    state.dirty = false;
+    flash("Saved \u2713", "ok");
+    poll();
+  } catch (e) {
+    flash(e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$("save").addEventListener("click", doSave);
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+    e.preventDefault();
+    doSave();
+  }
+});
+
+/* ---------------- config + status polling ---------------- */
+
+async function loadConfig() {
+  try {
+    const r = await fetch("/api/config");
+    if (!r.ok) return;
+    const text = await r.text();
+    if (text === $("config").value) return;
+    $("config").value = text;
+    syncGutterCount();
+  } catch (e) { /* transient */ }
+}
+
+async function poll() {
+  try {
+    const r = await fetch("/api/status");
+    if (!r.ok) return;
+    const s = await r.json();
+    if (s.theme) {
+      state.theme = s.theme;
+      applyTheme();
+    }
+    $("tz-label").textContent = "tz " + (s.timezone || "\u2014") + " \u00b7 utc " + (s.utc_now || "\u2014");
+    $("footer").textContent = (s.config_path || "\u2014") + " \u00b7 mtime " + (s.config_mtime || "\u2014") +
+      " \u00b7 cache " + (s.cache_entries ?? "\u2014");
+    if (s.last_error) {
+      $("error-text").textContent = "last error: " + s.last_error;
+      $("error-banner").hidden = false;
+    } else {
+      $("error-banner").hidden = true;
+    }
+    if (s.config_mtime && state.lastMtime && s.config_mtime !== state.lastMtime) {
+      dropLocalPreviews(); // config reloaded: local files may have changed
+    }
+    state.lastMtime = s.config_mtime || state.lastMtime;
+    renderTimeline(s.timeline || {});
+    if (!state.dirty) await loadConfig();
+  } catch (e) { /* transient */ }
+}
+
+/* ---------------- init ---------------- */
+
+syncGutterCount();
+loadConfig();
+poll();
+setInterval(poll, 5000);
+</script>
+</body>
+</html>

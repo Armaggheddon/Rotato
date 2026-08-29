@@ -1,0 +1,56 @@
+# Rotato — docker compose deployment
+#
+# Layout inside the container:
+#   /app/config/config.yaml   the service config (edited via the admin UI or on the host)
+#   /app/data/...             the image files; local `sources:` in the config are
+#                             relative to this dir (DATA_ROOT) — "day.jpg" means
+#                             /app/data/day.jpg
+#
+# Both are DIRECTORY mounts on purpose: a single-file bind mount breaks the
+# atomic-rename save that POST /api/config uses (SPEC §10) — the container would
+# keep the dead inode after the first save. On first start the built-in sample
+# config is written to /app/config/config.yaml automatically if it is missing.
+#
+# The container runs as PUID:PGID (Homepage-style, see `user:` below), so every
+# file the service creates — the seeded config, admin-UI saves — is owned by
+# that host user. Create the two directories owned by that user first:
+#
+#   mkdir -p config data && chown ${PUID:-1000}:${PGID:-1000} config data
+#
+# No CONFIG_PATH / PORT env vars here: they are fixed for this container
+# (only rotato runs in it) and hardcoded in main.go as
+# /app/config/config.yaml and port 8080. Map a different host
+# port with the `ports:` list if needed. PUID/PGID are consumed by compose's
+# `user:` directive (the process runs as that numeric uid/gid; the scratch
+# image has no shell, so the kernel's numeric IDs do the job directly).
+
+services:
+  rotato:
+    build:
+      context: .
+      args:
+        # Target architecture for the go build. Empty (default) = the build
+        # host's native arch; set TARGETARCH=arm64 (in .env or the shell) to
+        # build for a Raspberry Pi — Go cross-compiles with CGO_ENABLED=0, so
+        # this works even when building on an x86 machine.
+        TARGETARCH: ${TARGETARCH:-}
+    image: rotato:latest
+    container_name: rotato
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    # run the process as this host user; defaults to 1000:1000, override via
+    # PUID/PGID in a .env file or your shell environment
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      # user/group the container runs as (used by the `user:` directive above)
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      # timezone for at/until/dates when the config has no `tz:` (default UTC).
+      # Alternatively set `tz: Europe/Berlin` in config.yaml instead.
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+    # no healthcheck: the scratch image contains no shell or curl for probes —
+    # check from the host with `curl -s localhost:8080/health`

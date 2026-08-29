@@ -1,0 +1,27 @@
+# ── Rotato .gitignore ─────────────────────────────────────────────
+# User-owned runtime data (yours to keep out of version control):
+#   config/   service config + admin-UI saves (seeded automatically)
+#   data/     local image files for `sources:`
+# Local deployment overrides:
+#   .env      compose variable overrides (PUID/PGID/TZ/TARGETARCH)
+
+# User data
+/config/
+/data/
+.env
+
+# Local Go build
+/rotato
+/rotato.exe
+
+# Docker transfer artifacts
+*.tar.gz
+*.tgz
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
