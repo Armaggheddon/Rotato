@@ -18,7 +18,7 @@ Implement against it exactly; if code and spec diverge, update the spec.
   `cache.go` (fetching, preview cache, placeholder), `handlers.go` (HTTP).
   `admin.html` embedded via `go:embed`.
 - No logging, metrics, or auth. Exactly one startup line.
-- Docker image built from `scratch`, ~12 MB (~3.5 MB gzipped).
+- Docker image built from `scratch`, ~12 MB.
 - Internal clock is UTC arithmetic; wall-clock gates (`at`/`until`/`dates`)
   evaluate in the configured `tz` (default: `TZ` env or UTC). The tz database
   is embedded via `import _ "time/tzdata"`; interval cycles stay epoch-aligned.
@@ -38,7 +38,7 @@ docker compose up -d   # config mounted at /app/config, images at /app/data
 # For a Raspberry Pi (arm64) — even when building ON an x86 machine, since Go
 # cross-compiles natively with CGO_ENABLED=0 (no QEMU/binfmt needed):
 TARGETARCH=arm64 docker compose build
-# move the image to the Pi (3.5 MB gzipped):
+# move the image to the Pi (a tarball):
 docker save rotato:latest | gzip > rotato-arm64.tar.gz
 # ...copy the tarball over, then on the Pi:
 gunzip -c rotato-arm64.tar.gz | docker load && docker compose up -d

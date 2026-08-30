@@ -1,0 +1,34 @@
+# Keep the build context lean: only the Go source + go.mod/go.sum + admin.html
+# are needed to build. Excluding user data and VCS keeps every build small and
+# prevents config/ and data/ from being copied into the builder image layer.
+
+# VCS
+.git/
+
+# User-owned runtime data (mirrors .gitignore — must not enter the build)
+config/
+data/
+.env
+
+# Docs and assets (not needed to compile; admin.html is embedded, not these)
+docs/
+
+# Local Go build
+rotato
+rotato.exe
+
+# Docker transfer artifacts
+*.tar.gz
+*.tgz
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Dockerfile itself is needed (build context), but keep nothing else optional
+Dockerfile
+docker-compose.yml

@@ -17,7 +17,7 @@ rotation rules, and serves it with the correct `Content-Type`.
   <em>The admin UI: what's served now and next, plus the raw YAML editor.</em>
 </p>
 
-- **Tiny**: single static binary, Docker image built from `scratch` (~12 MB; ~3.5 MB gzipped).
+- **Tiny**: single static binary, Docker image built from `scratch` (~12 MB).
 - **Zero external state**: no database, no auth, no logging framework; one
   YAML file and the image files are all it needs.
 - **Admin UI**: a built-in terminal-styled page (`/admin`) to edit the config
@@ -278,7 +278,9 @@ docker compose up -d
 
 ```bash
 docker build -t rotato .
-docker run -p 8080:8080 \
+# run as the host user (1000:1000) so the seeded config and admin-UI saves
+# are owned by you, not root — same PUID/PGID model as the compose file
+docker run -p 8080:8080 --user 1000:1000 \
   -v $(pwd)/config:/app/config \
   -v $(pwd)/data:/app/data \
   rotato
@@ -305,7 +307,7 @@ cross-compiles natively with `CGO_ENABLED=0` (no QEMU/binfmt needed):
 TARGETARCH=arm64 docker compose build
 ```
 
-Then move the image to the Pi. With a tarball (about 3.5 MB gzipped):
+Then move the image to the Pi with a tarball:
 
 ```bash
 # on the build machine

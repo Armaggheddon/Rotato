@@ -27,7 +27,7 @@ Design principles:
   files (see §3); `admin.html` embedded via `go:embed`; the sample config is a
   Go string constant (`sampleConfig`) — no `config.yaml` file is shipped with
   the project.
-- Final Docker image built from `scratch`, target size ~12 MB (~3.5 MB gzipped).
+- Final Docker image built from `scratch`, target size ~12 MB.
 - No logging framework, no metrics, no authentication. Only a single startup line.
 - Timezone support is opt-in via `tz:` (IANA name); the tz database is embedded
   in the binary (`time/tzdata`), so it works in the scratch image with no extra
