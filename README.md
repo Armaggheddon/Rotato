@@ -17,7 +17,7 @@ rotation rules, and serves it with the correct `Content-Type`.
   <em>The admin UI: what's served now and next, plus the raw YAML editor.</em>
 </p>
 
-- **Tiny**: single static binary, Docker image built from `scratch` (~7 MB).
+- **Tiny**: single static binary, Docker image built from `scratch` (~12 MB; ~3.5 MB gzipped).
 - **Zero external state**: no database, no auth, no logging framework; one
   YAML file and the image files are all it needs.
 - **Admin UI**: a built-in terminal-styled page (`/admin`) to edit the config
@@ -131,8 +131,12 @@ images:
                              #           window is active (needs >= 2 sources)
       at: "18:00"            # daily: window start, HH:MM (required)
       until: "06:00"         # daily: window end, optional (default: midnight)
+      for: 8h                # daily: alternative to `until` — window length
+                             #   (mutually exclusive; whole minutes; 24h = all day)
       dates: ["25-12"]       # daily: optional calendar dates (DD-MM) the entry
                              #   is limited to; combines with the time window
+      weekdays: [mon, fri]   # daily: optional weekdays the entry is limited
+                             #   to (mon..sun, case-insensitive)
 
     refresh: 15m             # optional per-entry override of global `refresh`
                              #   (remote sources only)
@@ -152,8 +156,10 @@ the path container-absolute (`/path/img.jpg` → `/app/data/path/img.jpg`).
 | `interval` + `every` | ≥2 | Always active; cycles the list, each source shown for `every`. Epoch-aligned (`index = unix / every % len`) → deterministic across restarts, no state to store. |
 | `sequential` | ≥2 | Always active; advances **one step per GET request**: first hit serves `sources[0]`, the next `sources[1]`, … wrapping around. In-memory cursor (reset on restart). HEAD and `?id=` previews do not advance. |
 | `daily` + `at` | 1 | Active from `at` until midnight (in `tz`). Place it *after* the always-active entries it should shadow. |
-| `daily` + `at` + `until` | 1 | Active within `[at, until)`. If `until <= at` the window **wraps past midnight** (`at: "22:00", until: "06:00"` = evening + night). |
-| `daily` + `dates` | ≥1 | Active only on the listed `DD-MM` calendar days (in `tz`). Combines with the time window; both must match. `at: "00:00"` = all day. |
+| `daily` + `at` + `until` | 1 | Active within `[at, until)`. If `until <= at` the window **wraps past midnight** (`at: "22:00", until: "06:00"` = evening + night). If `until == at`, the window is the full 24h. |
+| `daily` + `at` + `for` | 1 | Window **length** instead of an end time: `at: "22:00" for: 8h` = 22:00–06:00, no mental arithmetic. Mutually exclusive with `until`; whole minutes only; `for: 24h` = all day. |
+| `daily` + `dates` (requires `at`) | ≥1 | Active only on the listed `DD-MM` calendar days (in `tz`). Combines with the time window; both must match. `at: "00:00"` = all day. |
+| `daily` + `weekdays` (requires `at`) | ≥1 | Active only on the listed weekdays (`mon`…`sun`, case-insensitive). Combines with the time window **and** `dates` — all must match. |
 | `daily` + `every` | ≥2 | Composition: while the daily window is active, also cycle the sources every `every`. |
 
 **`on_error`** decides what happens when the winning entry's source can't be
@@ -165,7 +171,7 @@ Supported image formats: PNG, JPEG, GIF, WebP.
 
 - **Times**: `"HH:MM"`, 24-hour, interpreted in the configured `tz`.
 - **Dates**: `"DD-MM"` (day-month), recurring every year, e.g. `"25-12"`.
-- **Durations** (`every`, `refresh`, `timeout`): Go duration strings
+- **Durations** (`every`, `for`, `refresh`, `timeout`): Go duration strings
   (`"30m"`, `"6h"`, `"3600s"`, `"24h"`) or a plain integer = seconds.
   `never` is accepted for `refresh` (= cache forever).
 
@@ -217,6 +223,42 @@ images:
       type: sequential
 ```
 
+### Full-day schedule
+
+A multi-step day is just stacked `daily` entries after an always-active base
+layer — file order is the only priority, so the last active entry wins:
+
+```yaml
+images:
+  - id: day          # base layer: always active unless overridden below
+    sources: day.jpg
+
+  - id: morning      # 06:00–12:00
+    sources: morning.jpg
+    rotation: { type: daily, at: "06:00", for: 6h }
+
+  - id: afternoon    # 12:00–18:00
+    sources: afternoon.jpg
+    rotation: { type: daily, at: "12:00", for: 6h }
+
+  - id: evening      # 18:00–22:00, cycling two sunsets every 30 min
+    sources: [sunsets/a.jpg, sunsets/b.jpg]
+    rotation: { type: daily, at: "18:00", for: 4h, every: 30m }
+
+  - id: night        # 22:00–06:00 (wraps past midnight)
+    sources: night.jpg
+    rotation: { type: daily, at: "22:00", for: 8h }
+
+  - id: weekend-morning  # Saturdays only, 08:00–12:00
+    sources: weekend.jpg
+    rotation: { type: daily, at: "08:00", for: 4h, weekdays: [sat] }
+```
+
+The admin UI's timeline (`/api/status`) renders the composed schedule, and a
+config where one entry can never win (always shadowed by a later one) is
+reported as a non-blocking **warning** on `/api/status` and
+`/api/config/validate`.
+
 ## Running it
 
 ### Docker Compose (recommended)
@@ -263,7 +305,7 @@ cross-compiles natively with `CGO_ENABLED=0` (no QEMU/binfmt needed):
 TARGETARCH=arm64 docker compose build
 ```
 
-Then move the image to the Pi. With a tarball (about 3 MB gzipped):
+Then move the image to the Pi. With a tarball (about 3.5 MB gzipped):
 
 ```bash
 # on the build machine
@@ -337,9 +379,9 @@ docker compose up -d --force-recreate
 | `/favicon.svg` | GET | The app favicon as SVG (the admin UI's icon). Use it for Homepage's `favicon:` / app icons. |
 | `/api/config` | GET | The current `config.yaml` content (plain text). |
 | `/api/config` | POST | Validates the body, writes it atomically, triggers a reload. `400` + the exact error when invalid. Body capped at 1 MB. |
-| `/api/config/validate` | POST | Dry-run: parses and validates without writing. Powers the admin UI's live validity indicator. |
+| `/api/config/validate` | POST | Dry-run: parses and validates without writing. `200` with `{"valid": true, "warnings": [...]}` (non-blocking never-wins warnings). Powers the admin UI's live validity indicator. |
 | `/api/preview?src=` | GET | Raw bytes of one source (path or URL) from the preview cache; used by the admin UI's carousel. |
-| `/api/status` | GET | JSON: `utc_now`, `timezone`, `active_entry_id`, `active_source`, `config_path`, `config_mtime`, `last_error`, `cache_entries`, `theme`, and `timeline` (prev/current/next slots + `next_change`). The "why is my dashboard showing the wrong picture" debugging aid. |
+| `/api/status` | GET | JSON: `utc_now`, `timezone`, `active_entry_id`, `active_source`, `config_path`, `config_mtime`, `last_error`, `warnings`, `cache_entries`, `theme`, and `timeline` (prev/current/next slots + `next_change`). The "why is my dashboard showing the wrong picture" debugging aid. |
 | `/health` | GET | `200 OK`. |
 
 `/image` response headers: `Content-Type`, `ETag` (hash of the bytes),
@@ -385,6 +427,9 @@ favicon: http://<host>:8080/favicon.svg
   and the full `timeline` (what was served, what's next, and when the next
   change happens). Remember: the **last** active entry wins; later entries
   override earlier ones.
+- **An entry never shows up**: `/api/status` → `warnings` lists entries that
+  can never win — a later always-active entry, or a later entry with the
+  identical activation window. Move or drop the shadowed entry.
 - **Times are off by hours**: set `tz:` (or the `TZ` env var). `at`/`until`/
   `dates` are wall-clock gates in the configured timezone, not UTC.
 - **Remote image keeps failing**: check `/api/status` → `last_error`, and the

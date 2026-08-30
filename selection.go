@@ -13,20 +13,51 @@ import (
 
 var errNoEntry = errors.New("no active entry")
 
+// windowOf resolves a daily entry's activation window as minutes since local
+// midnight: active iff `start <= mins < start+dur`. `until` and `for` are two
+// encodings of the same window: `until` gives dur = (until-start+1440) % 1440
+// (with at == until meaning the full 24h), `for` is the explicit length in
+// whole minutes (validation enforces both). dur is always > 0 (1440 = all day).
+func windowOf(r Rotation) (start, dur int, ok bool) {
+	start, ok = parseHM(r.At)
+	if !ok {
+		return 0, 0, false
+	}
+	if r.For > 0 {
+		dur = int(r.For / 60)
+		if dur <= 0 || dur > 1440 {
+			return 0, 0, false
+		}
+		return start, dur, true
+	}
+	end, ok := parseHM(defaultUntil(r))
+	if !ok {
+		return 0, 0, false
+	}
+	dur = (end - start + 1440) % 1440
+	if dur == 0 {
+		dur = 1440 // at == until → the full 24 hours
+	}
+	return start, dur, true
+}
+
+// weekdayKey renders t's weekday as the lowercase 3-letter `weekdays` gate
+// format ("mon", "tue", ...).
+func weekdayKey(t time.Time) string {
+	return strings.ToLower(t.Weekday().String()[:3])
+}
+
 // entryActive reports whether e is active at now (§4.4). The daily time
-// window and the date gate are evaluated against the wall clock in loc (the
-// configured timezone), so `at`/`until`/`dates` mean what they say on a local
-// clock. DST edge days follow wall-clock semantics: a spring-forward hour
-// never matches, a repeated fall-back hour matches twice.
+// window, the date gate, and the weekday gate are evaluated against the wall
+// clock in loc (the configured timezone), so `at`/`until`/`dates`/`weekdays`
+// mean what they say on a local clock. DST edge days follow wall-clock
+// semantics: a spring-forward hour never matches, a repeated fall-back hour
+// matches twice.
 func entryActive(e ImageEntry, now time.Time, loc *time.Location) bool {
 	if e.Rotation.Type != "daily" {
 		return true // static, interval and sequential are always active
 	}
-	start, ok := parseHM(e.Rotation.At)
-	if !ok {
-		return false
-	}
-	end, ok := parseHM(defaultUntil(e.Rotation))
+	start, dur, ok := windowOf(e.Rotation)
 	if !ok {
 		return false
 	}
@@ -34,9 +65,13 @@ func entryActive(e ImageEntry, now time.Time, loc *time.Location) bool {
 	if len(e.Rotation.Dates) > 0 && !containsStr(e.Rotation.Dates, dateKey(local)) {
 		return false
 	}
+	if len(e.Rotation.Weekdays) > 0 && !containsStr(e.Rotation.Weekdays, weekdayKey(local)) {
+		return false
+	}
 	mins := local.Hour()*60 + local.Minute()
-	if end <= start {
-		return mins >= start || mins < end // window wraps past midnight
+	end := start + dur
+	if end > 1440 {
+		return mins >= start || mins < end-1440 // window wraps past midnight
 	}
 	return mins >= start && mins < end
 }
@@ -195,18 +230,26 @@ func conditionText(e ImageEntry) string {
 	case "sequential":
 		return "sequential"
 	case "daily":
-		until := defaultUntil(e.Rotation)
 		var s string
-		if r.At == until {
+		if r.For > 0 {
+			if int(r.For/60) == 1440 {
+				s = "daily all day"
+			} else {
+				s = "daily " + r.At + " for " + fmtDur(r.For)
+			}
+		} else if r.At == defaultUntil(e.Rotation) {
 			s = "daily all day"
 		} else {
-			s = "daily " + r.At + "–" + until
+			s = "daily " + r.At + "–" + defaultUntil(e.Rotation)
 		}
 		if r.Every > 0 {
 			s += " · every " + fmtDur(r.Every)
 		}
 		if len(r.Dates) > 0 {
 			s += " · " + strings.Join(r.Dates, ",")
+		}
+		if len(r.Weekdays) > 0 {
+			s += " · " + strings.Join(r.Weekdays, ",")
 		}
 		return s
 	}
@@ -278,6 +321,10 @@ func candidates(c *Config, now time.Time, loc *time.Location, future bool) []tim
 	for i := range c.Images {
 		e := &c.Images[i]
 		if e.Rotation.Type == "daily" {
+			start, dur, ok := windowOf(e.Rotation)
+			if !ok {
+				continue
+			}
 			lo, hi := 0, 2 // today .. day+2 covers any 48h window
 			if !future {
 				lo, hi = -2, 0 // today .. day-2
@@ -287,15 +334,16 @@ func candidates(c *Config, now time.Time, loc *time.Location, future bool) []tim
 				if len(e.Rotation.Dates) > 0 && !containsStr(e.Rotation.Dates, dateKey(day)) {
 					continue
 				}
+				if len(e.Rotation.Weekdays) > 0 && !containsStr(e.Rotation.Weekdays, weekdayKey(day)) {
+					continue
+				}
 				yy, mm, dd := day.Date()
-				if e.Rotation.At != "" {
-					if start, ok := parseHM(e.Rotation.At); ok {
-						add(time.Date(yy, mm, dd, start/60, start%60, 0, 0, loc))
-					}
-				}
-				if end, ok := parseHM(defaultUntil(e.Rotation)); ok {
-					add(time.Date(yy, mm, dd, end/60, end%60, 0, 0, loc))
-				}
+				startAt := time.Date(yy, mm, dd, start/60, start%60, 0, 0, loc)
+				add(startAt)
+				// The window end is start+dur minutes — for a wrap (end >
+				// 1440) this lands on the next calendar day, which
+				// time.Date(yy, mm, dd, end/60, ...) could not express.
+				add(startAt.Add(time.Duration(dur) * time.Minute))
 			}
 		}
 		if e.Rotation.Every > 0 {

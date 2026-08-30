@@ -32,11 +32,12 @@ type statInfo struct {
 
 var (
 	config       *Config
-	mu           sync.RWMutex // guards config, timeLoc, lastErr, seqIdx, imageCache, previewCache
+	mu           sync.RWMutex // guards config, timeLoc, lastErr, lastWarnings, seqIdx, imageCache, previewCache
 	imageCache   map[string]cacheEntry
 	previewCache map[string]cacheEntry // /api/preview bytes (separate from the serving cache)
 	lastStat     statInfo
 	lastErr      error
+	lastWarnings []string                  // structural never-wins warnings for the current config (guarded by mu)
 	timeLoc      *time.Location = time.UTC // location for at/until/dates wall-clock gates
 
 	configPath string           // CONFIG_PATH

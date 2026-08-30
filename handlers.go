@@ -36,8 +36,13 @@ func handleImage(w http.ResponseWriter, r *http.Request) {
 			src = sequentialSource(entry, true)
 		}
 	}
-	// Local files are streamed straight from disk (never byte-cached); remote
-	// sources are served from the bounded cache.
+	serveEntry(w, r, entry, src, now)
+}
+
+// serveEntry writes one entry's source — remote bytes from the bounded cache,
+// local files streamed straight from disk — and bounds the serving cache
+// afterwards (current + next remote sources only).
+func serveEntry(w http.ResponseWriter, r *http.Request, entry ImageEntry, src string, now time.Time) {
 	if isRemote(src) {
 		data, ct, err := getRemoteBytes(src)
 		if err != nil {
@@ -210,6 +215,7 @@ func handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 	if lastErr != nil {
 		lastErrVal = lastErr.Error()
 	}
+	warnings := append([]string(nil), lastWarnings...)
 	mu.RUnlock()
 	tl := Timeline{}
 	if c != nil {
@@ -242,6 +248,7 @@ func handleAPIStatus(w http.ResponseWriter, r *http.Request) {
 		"config_path":     configPath,
 		"config_mtime":    mtime,
 		"last_error":      lastErrVal,
+		"warnings":        warnings,
 		"cache_entries":   cacheCount,
 		"theme":           themeForStatus(),
 		"timeline":        tl,
@@ -311,12 +318,13 @@ func handleAPIConfigValidate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if _, err := parseConfig(data); err != nil {
+	c, err := parseConfig(data)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"valid": true})
+	json.NewEncoder(w).Encode(map[string]any{"valid": true, "warnings": configWarnings(c)})
 }
 
 // handleAPIPreview serves the bytes of one source (local path or remote URL)

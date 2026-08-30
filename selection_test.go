@@ -813,3 +813,178 @@ func TestBuildTimelineTZ(t *testing.T) {
 		t.Errorf("next_change.entry_id = %q, want %q", tl.NextChange.EntryID, "eve")
 	}
 }
+
+// TestEntryActiveFor covers the `for:` window encoding: an explicit window
+// length that is an alternative to `until` (including wrap past midnight and
+// for: 24h = all day).
+func TestEntryActiveFor(t *testing.T) {
+	window := ImageEntry{ // daily 10:00 for 4h, no wrap
+		ID:       "window",
+		Sources:  []string{"/data/a.jpg"},
+		Rotation: Rotation{Type: "daily", At: "10:00", For: Duration(4 * 3600)},
+	}
+	wrap := ImageEntry{ // daily 22:00 for 8h, wraps past midnight
+		ID:       "wrap",
+		Sources:  []string{"/data/a.jpg"},
+		Rotation: Rotation{Type: "daily", At: "22:00", For: Duration(8 * 3600)},
+	}
+	allday := ImageEntry{ // daily 09:00 for 24h → full day
+		ID:       "allday",
+		Sources:  []string{"/data/a.jpg"},
+		Rotation: Rotation{Type: "daily", At: "09:00", For: Duration(24 * 3600)},
+	}
+	halfhour := ImageEntry{ // for in sub-hour units is fine when whole minutes
+		ID:       "halfhour",
+		Sources:  []string{"/data/a.jpg"},
+		Rotation: Rotation{Type: "daily", At: "12:30", For: Duration(30 * 60)},
+	}
+
+	cases := []struct {
+		name  string
+		entry ImageEntry
+		now   time.Time
+		want  bool
+	}{
+		{"09:59 before start", window, hm(9, 59), false},
+		{"10:00 at start", window, hm(10, 0), true},
+		{"13:59 inside", window, hm(13, 59), true},
+		{"14:00 at end", window, hm(14, 0), false},
+		{"21:59 before wrap start", wrap, hm(21, 59), false},
+		{"22:00 at wrap start", wrap, hm(22, 0), true},
+		{"23:59 inside wrap", wrap, hm(23, 59), true},
+		{"00:00 after midnight", wrap, hm(0, 0), true},
+		{"05:59 before wrap end", wrap, hm(5, 59), true},
+		{"06:00 at wrap end", wrap, hm(6, 0), false},
+		{"12:00 midday", wrap, hm(12, 0), false},
+		{"allday 00:00", allday, hm(0, 0), true},
+		{"allday 08:59", allday, hm(8, 59), true},
+		{"allday 09:00", allday, hm(9, 0), true},
+		{"allday 23:59", allday, hm(23, 59), true},
+		{"halfhour 12:30 at start", halfhour, hm(12, 30), true},
+		{"halfhour 13:00 at end", halfhour, hm(13, 0), false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := entryActive(tc.entry, tc.now, time.UTC); got != tc.want {
+				t.Errorf("entryActive(%s) = %v, want %v", tc.now.Format("15:04"), got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEntryActiveWeekdays covers the `weekdays:` gate (AND-combined with the
+// time window). 1970-01-01 is a Thursday; 1970-01-03/04 are Sat/Sun.
+func TestEntryActiveWeekdays(t *testing.T) {
+	weekend := ImageEntry{ // all day, weekends only
+		ID:       "weekend",
+		Sources:  []string{"/data/a.jpg"},
+		Rotation: Rotation{Type: "daily", At: "00:00", Weekdays: []string{"sat", "sun"}},
+	}
+	workday := ImageEntry{ // daily 09:00–17:00, weekdays only
+		ID:       "workday",
+		Sources:  []string{"/data/a.jpg"},
+		Rotation: Rotation{Type: "daily", At: "09:00", Until: "17:00", Weekdays: []string{"mon", "tue", "wed", "thu", "fri"}},
+	}
+
+	cases := []struct {
+		name  string
+		entry ImageEntry
+		now   time.Time
+		want  bool
+	}{
+		{"thu 00:00 weekend misses", weekend, hm(0, 0), false},
+		{"thu 12:00 weekend misses", weekend, hm(12, 0), false},
+		{"sat 12:00 weekend hits", weekend, time.Date(1970, 1, 3, 12, 0, 0, 0, time.UTC), true},
+		{"sun 12:00 weekend hits", weekend, time.Date(1970, 1, 4, 12, 0, 0, 0, time.UTC), true},
+		{"mon 12:00 weekend misses", weekend, time.Date(1970, 1, 5, 12, 0, 0, 0, time.UTC), false},
+		{"thu 10:00 workday hits", workday, hm(10, 0), true},
+		{"thu 18:00 window misses", workday, hm(18, 0), false},
+		{"thu 00:00 window misses", workday, hm(0, 0), false},
+		{"sat 10:00 weekday misses", workday, time.Date(1970, 1, 3, 10, 0, 0, 0, time.UTC), false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := entryActive(tc.entry, tc.now, time.UTC); got != tc.want {
+				t.Errorf("entryActive(%s) = %v, want %v", tc.now.Format("2006-01-02 15:04"), got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCandidatesForWindow checks that a `for:` window crossing midnight emits
+// its end boundary on the next calendar day (the instant the window closes).
+func TestCandidatesForWindow(t *testing.T) {
+	wrap := ImageEntry{ // daily 22:00 for 8h → ends 06:00 next day
+		ID:       "wrap",
+		Sources:  []string{"/data/a.jpg"},
+		Rotation: Rotation{Type: "daily", At: "22:00", For: Duration(8 * 3600)},
+	}
+	c := &Config{Images: []ImageEntry{wrap}}
+	now := time.Date(1970, 1, 1, 12, 0, 0, 0, time.UTC) // Thursday noon
+	cs := candidates(c, now, time.UTC, true)
+	want := []string{
+		"1970-01-01T22:00:00Z", // window opens
+		"1970-01-02T06:00:00Z", // window closes (next day)
+		"1970-01-02T22:00:00Z",
+		"1970-01-03T06:00:00Z",
+	}
+	if len(cs) != len(want) {
+		t.Fatalf("candidates = %v, want %v", cs, want)
+	}
+	for i := range cs {
+		if got := cs[i].UTC().Format(time.RFC3339); got != want[i] {
+			t.Errorf("candidates[%d] = %s, want %s", i, got, want[i])
+		}
+	}
+}
+
+// TestCandidatesWeekdays checks that the candidates planner skips weekend
+// days for a weekday-only gate.
+func TestCandidatesWeekdays(t *testing.T) {
+	wd := ImageEntry{ // daily 09:00–17:00, weekdays only
+		ID:       "wd",
+		Sources:  []string{"/data/a.jpg"},
+		Rotation: Rotation{Type: "daily", At: "09:00", Until: "17:00", Weekdays: []string{"mon", "tue", "wed", "thu", "fri"}},
+	}
+	c := &Config{Images: []ImageEntry{wd}}
+	now := time.Date(1970, 1, 1, 12, 0, 0, 0, time.UTC) // Thursday noon
+	cs := candidates(c, now, time.UTC, true)
+	want := []string{
+		"1970-01-01T17:00:00Z", // Thursday close
+		"1970-01-02T09:00:00Z", // Friday open
+		"1970-01-02T17:00:00Z", // Friday close (Sat/Sun skipped; Mon beyond 48h)
+	}
+	if len(cs) != len(want) {
+		t.Fatalf("candidates = %v, want %v", cs, want)
+	}
+	for i := range cs {
+		if got := cs[i].UTC().Format(time.RFC3339); got != want[i] {
+			t.Errorf("candidates[%d] = %s, want %s", i, got, want[i])
+		}
+	}
+}
+
+// TestConditionTextForWeekdays covers the rendered conditions for the new
+// `for` and `weekdays` fields.
+func TestConditionTextForWeekdays(t *testing.T) {
+	cases := []struct {
+		name string
+		rot  Rotation
+		want string
+	}{
+		{"for window", Rotation{Type: "daily", At: "18:00", For: Duration(6 * 3600)}, "daily 18:00 for 6h"},
+		{"for all day", Rotation{Type: "daily", At: "09:00", For: Duration(24 * 3600)}, "daily all day"},
+		{"for + every + weekdays", Rotation{Type: "daily", At: "18:00", For: Duration(6 * 3600), Every: Duration(1800), Weekdays: []string{"mon", "fri"}}, "daily 18:00 for 6h · every 30m · mon,fri"},
+		{"until + weekdays", Rotation{Type: "daily", At: "09:00", Until: "17:00", Weekdays: []string{"mon"}}, "daily 09:00–17:00 · mon"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := ImageEntry{ID: "e", Sources: []string{"/data/a.jpg"}, Rotation: tc.rot}
+			if got := conditionText(e); got != tc.want {
+				t.Errorf("conditionText = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

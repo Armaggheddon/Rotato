@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -89,6 +91,25 @@ images:
   #     type: daily
   #     dates: ["25-12"]
   #     at: "00:00"
+
+  # More daily-window options (both commented out; see README for details):
+  # "for:" is a window length — an alternative to "until" (mutually exclusive;
+  # whole minutes; 24h = all day). 22:00 "for" 8h = 22:00–06:00, no arithmetic:
+  # - id: night-for
+  #   sources: night.jpg
+  #   rotation:
+  #     type: daily
+  #     at: "22:00"
+  #     for: 8h
+  # "weekdays:" limits an entry to specific weekdays (mon..sun, case-insensitive)
+  # and combines with the time window and "dates" — all must match. Weekends only:
+  # - id: weekend
+  #   sources: weekend.jpg
+  #   rotation:
+  #     type: daily
+  #     at: "08:00"
+  #     for: 10h
+  #     weekdays: [sat, sun]
 `
 
 // Duration stores a length of time in seconds. 0 = unset/never.
@@ -113,11 +134,13 @@ type ImageEntry struct {
 }
 
 type Rotation struct {
-	Type  string   `yaml:"type"`  // "static" | "interval" | "daily" | "sequential"; "" = static
-	Every Duration `yaml:"every"` // 0 = unset
-	At    string   `yaml:"at"`    // "HH:MM"
-	Until string   `yaml:"until"` // "HH:MM"; "" = "00:00"
-	Dates []string `yaml:"dates"` // "DD-MM" calendar dates gating a daily entry
+	Type     string   `yaml:"type"`     // "static" | "interval" | "daily" | "sequential"; "" = static
+	Every    Duration `yaml:"every"`    // 0 = unset
+	At       string   `yaml:"at"`       // "HH:MM"
+	Until    string   `yaml:"until"`    // "HH:MM"; "" = "00:00"
+	For      Duration `yaml:"for"`      // daily window length; mutually exclusive with `until` (whole minutes, <= 24h)
+	Dates    []string `yaml:"dates"`    // "DD-MM" calendar dates gating a daily entry
+	Weekdays []string `yaml:"weekdays"` // "mon".."sun" weekdays gating a daily entry (AND-combines with dates)
 }
 
 // Theme controls the admin-UI look (§4.2): a display mode plus one palette
@@ -194,10 +217,12 @@ func loadConfig(path string) error {
 		recordErr(err)
 		return err
 	}
+	warnings := configWarnings(c) // pure, computed before the lock
 	mu.Lock()
 	config = c
 	timeLoc = loc
 	lastErr = nil
+	lastWarnings = warnings
 	// drop sequential cursors for entries that no longer exist
 	for id := range seqIdx {
 		gone := true
@@ -397,7 +422,7 @@ func parseRotation(n *yaml.Node) (*Rotation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("rotation: %w", err)
 	}
-	if err := rejectUnknown(m, "type", "every", "at", "until", "dates"); err != nil {
+	if err := rejectUnknown(m, "type", "every", "at", "until", "for", "dates", "weekdays"); err != nil {
 		return nil, err
 	}
 	r := &Rotation{}
@@ -417,12 +442,29 @@ func parseRotation(n *yaml.Node) (*Rotation, error) {
 	if v, ok := m["until"]; ok {
 		r.Until = v.Value
 	}
+	if v, ok := m["for"]; ok {
+		d, err := parseDurationNode(v)
+		if err != nil {
+			return nil, fmt.Errorf("for: %w", err)
+		}
+		r.For = d
+	}
 	if v, ok := m["dates"]; ok {
 		ds, err := parseStringList(v, "dates")
 		if err != nil {
 			return nil, err
 		}
 		r.Dates = ds
+	}
+	if v, ok := m["weekdays"]; ok {
+		ws, err := parseStringList(v, "weekdays")
+		if err != nil {
+			return nil, err
+		}
+		for i := range ws {
+			ws[i] = strings.ToLower(ws[i]) // normalize "Mon"/"MON" → "mon"
+		}
+		r.Weekdays = ws
 	}
 	return r, nil
 }
@@ -513,6 +555,9 @@ func parseDurationNode(n *yaml.Node) (Duration, error) {
 	if err != nil {
 		return 0, fmt.Errorf("invalid duration %q (use a Go duration like \"30m\" or integer seconds)", s)
 	}
+	if d%time.Second != 0 {
+		return 0, fmt.Errorf("invalid duration %q: must be a whole number of seconds (\"500ms\" would truncate)", s)
+	}
 	return Duration(d / time.Second), nil
 }
 
@@ -589,8 +634,11 @@ func validateConfig(c *Config) error {
 			if r.Every > 0 {
 				return fmt.Errorf("entry %q: `every` with a single source — add more sources or drop `every`", e.ID)
 			}
-			if len(r.Dates) > 0 {
-				return fmt.Errorf("entry %q: `dates` requires `type: daily`", e.ID)
+			if r.At != "" || r.Until != "" {
+				return fmt.Errorf("entry %q: `at`/`until` require `type: daily`", e.ID)
+			}
+			if len(r.Dates) > 0 || len(r.Weekdays) > 0 || r.For > 0 {
+				return fmt.Errorf("entry %q: `dates`/`weekdays`/`for` require `type: daily`", e.ID)
 			}
 		case "interval":
 			if len(e.Sources) < 2 {
@@ -599,12 +647,29 @@ func validateConfig(c *Config) error {
 			if r.Every <= 0 {
 				return fmt.Errorf("entry %q: interval requires `every` > 0", e.ID)
 			}
-			if len(r.Dates) > 0 {
-				return fmt.Errorf("entry %q: `dates` requires `type: daily`", e.ID)
+			if r.At != "" || r.Until != "" {
+				return fmt.Errorf("entry %q: `at`/`until` require `type: daily`", e.ID)
+			}
+			if len(r.Dates) > 0 || len(r.Weekdays) > 0 || r.For > 0 {
+				return fmt.Errorf("entry %q: `dates`/`weekdays`/`for` require `type: daily`", e.ID)
 			}
 		case "daily":
 			if r.At == "" {
-				return fmt.Errorf("entry %q: daily requires `at`", e.ID)
+				return fmt.Errorf("entry %q: daily requires `at` (add at: \"00:00\" for an all-day gate)", e.ID)
+			}
+			if r.Until != "" && r.For > 0 {
+				return fmt.Errorf("entry %q: `until` and `for` are mutually exclusive — pick one window encoding", e.ID)
+			}
+			if r.For < 0 {
+				return fmt.Errorf("entry %q: `for` must be positive", e.ID)
+			}
+			if r.For > 0 {
+				if r.For%60 != 0 {
+					return fmt.Errorf("entry %q: `for` must be a whole number of minutes (window gates are minute-granular), got %s", e.ID, fmtDur(r.For))
+				}
+				if r.For > 24*60*60 {
+					return fmt.Errorf("entry %q: `for` must be at most 24h", e.ID)
+				}
 			}
 			if len(e.Sources) >= 2 && r.Every <= 0 {
 				return fmt.Errorf("entry %q: daily with %d sources needs `every` — add `every` to cycle within the window, or use a single source", e.ID, len(e.Sources))
@@ -617,6 +682,11 @@ func validateConfig(c *Config) error {
 					return fmt.Errorf("entry %q: dates: %w", e.ID, err)
 				}
 			}
+			for _, wd := range r.Weekdays {
+				if !validWeekday(wd) {
+					return fmt.Errorf("entry %q: weekdays: %q must be one of mon..sun (e.g. \"mon\", \"fri\")", e.ID, wd)
+				}
+			}
 		case "sequential":
 			if len(e.Sources) < 2 {
 				return fmt.Errorf("entry %q: sequential needs at least 2 sources — use `static` for a single source", e.ID)
@@ -627,14 +697,102 @@ func validateConfig(c *Config) error {
 			if e.OnError == "skip" {
 				return fmt.Errorf("entry %q: on_error `skip` is not supported with sequential — use `placeholder`", e.ID)
 			}
-			if len(r.Dates) > 0 {
-				return fmt.Errorf("entry %q: `dates` requires `type: daily`", e.ID)
+			if r.At != "" || r.Until != "" {
+				return fmt.Errorf("entry %q: `at`/`until` require `type: daily`", e.ID)
+			}
+			if len(r.Dates) > 0 || len(r.Weekdays) > 0 || r.For > 0 {
+				return fmt.Errorf("entry %q: `dates`/`weekdays`/`for` require `type: daily`", e.ID)
 			}
 		default:
 			return fmt.Errorf("entry %q: unknown rotation type %q", e.ID, r.Type)
 		}
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Structural warnings (never-wins detection)
+// ---------------------------------------------------------------------------
+
+// validWeekday reports whether s names a weekday in the `weekdays` gate
+// format ("mon".."sun", case-insensitive).
+func validWeekday(s string) bool {
+	switch strings.ToLower(s) {
+	case "mon", "tue", "wed", "thu", "fri", "sat", "sun":
+		return true
+	}
+	return false
+}
+
+// configWarnings returns structural warnings about entries that can never be
+// served. Like the timeline, warnings are structural — no fetch checks — so a
+// failing on_error:"skip" entry can diverge from what /image actually serves.
+// The checks are exact (a later entry really does shadow this one), so there
+// are no false positives; they never block a save.
+func configWarnings(c *Config) []string {
+	// alwaysActive reports whether an entry is structurally active at every
+	// instant: a static/interval/sequential entry (unless it can skip), or a
+	// daily entry whose gate covers the whole day with no dates/weekdays.
+	alwaysActive := func(x *ImageEntry) bool {
+		if x.Rotation.Type != "daily" {
+			return x.OnError != "skip"
+		}
+		_, dur, ok := windowOf(x.Rotation)
+		return ok && dur == 1440 && len(x.Rotation.Dates) == 0 && len(x.Rotation.Weekdays) == 0
+	}
+	var out []string
+	for i := range c.Images {
+		e := &c.Images[i]
+		// 1. A later always-active entry shadows everything before it.
+		//    on_error:"skip" entries are excluded: when their fetch fails,
+		//    earlier entries still serve.
+		for j := i + 1; j < len(c.Images); j++ {
+			if alwaysActive(&c.Images[j]) {
+				out = append(out, fmt.Sprintf("entry %q can never be served: a later entry %q is always active and overrides it (move always-active entries above daily ones)", e.ID, c.Images[j].ID))
+				break
+			}
+		}
+		// 2. A later daily entry with the identical gate (same window, dates,
+		//    weekdays) shadows this one. `until` and `for` are compared after
+		//    normalization to the same (start, dur) window form.
+		for j := i + 1; j < len(c.Images); j++ {
+			other := &c.Images[j]
+			if other.Rotation.Type == "daily" && sameGate(e, other) {
+				out = append(out, fmt.Sprintf("entry %q can never be served: a later entry %q has the identical activation window", e.ID, other.ID))
+				break
+			}
+		}
+	}
+	return out
+}
+
+// sameGate reports whether two daily entries have the same activation gate:
+// the same (start, dur) window — `until` and `for` are alternative encodings
+// of the same window — plus the same dates and weekdays sets (order-insensitive).
+func sameGate(a, b *ImageEntry) bool {
+	as, ad, aok := windowOf(a.Rotation)
+	bs, bd, bok := windowOf(b.Rotation)
+	if !aok || !bok || as != bs || ad != bd {
+		return false
+	}
+	return strSetEqual(a.Rotation.Dates, b.Rotation.Dates) && strSetEqual(a.Rotation.Weekdays, b.Rotation.Weekdays)
+}
+
+// strSetEqual compares two string lists as sets (order-insensitive).
+func strSetEqual(x, y []string) bool {
+	if len(x) != len(y) {
+		return false
+	}
+	a := append([]string(nil), x...)
+	b := append([]string(nil), y...)
+	sort.Strings(a)
+	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ---------------------------------------------------------------------------

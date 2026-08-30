@@ -439,3 +439,57 @@ func TestPlaceholderServing(t *testing.T) {
 		t.Errorf("body = %q, want the built-in placeholderGIF fallback", rr.Body.String())
 	}
 }
+
+// TestHandleAPIStatusWarnings: /api/status carries the structural warnings
+// for the current config.
+func TestHandleAPIStatusWarnings(t *testing.T) {
+	setConfig(t, &Config{Images: []ImageEntry{
+		{ID: "a", Sources: []string{"/data/a.jpg"}},
+		{ID: "b", Sources: []string{"/data/b.jpg"}},
+	}})
+	mu.Lock()
+	lastWarnings = configWarnings(config)
+	mu.Unlock()
+	rr := httptest.NewRecorder()
+	handleAPIStatus(rr, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	var resp struct {
+		Warnings []string `json:"warnings"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Warnings) != 1 || !strings.Contains(resp.Warnings[0], `"a"`) {
+		t.Errorf("warnings = %v, want one warning about entry a", resp.Warnings)
+	}
+}
+
+// TestHandleAPIConfigValidateWarnings: the validate dry-run reports warnings
+// for a structurally broken (but valid) config without saving anything.
+func TestHandleAPIConfigValidateWarnings(t *testing.T) {
+	body := `images:
+  - id: a
+    sources: /data/a.jpg
+  - id: b
+    sources: /data/b.jpg
+`
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/config/validate", strings.NewReader(body))
+	req.Header.Set("Content-Type", "text/plain")
+	handleAPIConfigValidate(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Valid    bool     `json:"valid"`
+		Warnings []string `json:"warnings"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Valid {
+		t.Fatal("valid = false, want true")
+	}
+	if len(resp.Warnings) != 1 {
+		t.Errorf("warnings = %v, want 1", resp.Warnings)
+	}
+}

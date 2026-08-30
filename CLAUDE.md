@@ -18,7 +18,7 @@ Implement against it exactly; if code and spec diverge, update the spec.
   `cache.go` (fetching, preview cache, placeholder), `handlers.go` (HTTP).
   `admin.html` embedded via `go:embed`.
 - No logging, metrics, or auth. Exactly one startup line.
-- Docker image built from `scratch`, ~6–8 MB.
+- Docker image built from `scratch`, ~12 MB (~3.5 MB gzipped).
 - Internal clock is UTC arithmetic; wall-clock gates (`at`/`until`/`dates`)
   evaluate in the configured `tz` (default: `TZ` env or UTC). The tz database
   is embedded via `import _ "time/tzdata"`; interval cycles stay epoch-aligned.
@@ -38,7 +38,7 @@ docker compose up -d   # config mounted at /app/config, images at /app/data
 # For a Raspberry Pi (arm64) — even when building ON an x86 machine, since Go
 # cross-compiles natively with CGO_ENABLED=0 (no QEMU/binfmt needed):
 TARGETARCH=arm64 docker compose build
-# move the image to the Pi (3 MB gzipped):
+# move the image to the Pi (3.5 MB gzipped):
 docker save rotato:latest | gzip > rotato-arm64.tar.gz
 # ...copy the tarball over, then on the Pi:
 gunzip -c rotato-arm64.tar.gz | docker load && docker compose up -d
@@ -52,8 +52,11 @@ gunzip -c rotato-arm64.tar.gz | docker load && docker compose up -d
   `img.jpg` → `/app/data/img.jpg`; leading slashes are still data-relative.
 - Rotation types: `static` | `interval` (cycle sources every `every`) | `daily`
   (active within `[at, until)`, wrapping past midnight when `until <= at`;
-  optional `dates: ["DD-MM"]` limits it to those calendar days) |
-  `sequential` (advance one source per GET, wrap around; in-memory cursor).
+  `for: <dur>` is the alternative window encoding — length instead of `until`,
+  mutually exclusive, whole minutes only, 24h = all day; optional
+  `dates: ["DD-MM"]` and `weekdays: [mon..sun]` gates AND-combine with the
+  window) | `sequential` (advance one source per GET, wrap around; in-memory
+  cursor).
 - `refresh` (default 1h) re-fetches remote sources; `on_error: skip | placeholder`.
   Serving is memory-bounded: local files are streamed from disk (never
   byte-cached; ETag from mtime+size), remote sources keep only the current +
@@ -64,6 +67,14 @@ gunzip -c rotato-arm64.tar.gz | docker load && docker compose up -d
   falls back to the built-in 1×1 transparent GIF when unset or unloadable.
 - Selection logic lives in small pure functions (`entryActive`, `currentSource`,
   `selectEntry`) so tests can table-test it against fixed timestamps.
+  `windowOf(r)` normalizes a daily gate to `(start, dur)` minutes — both
+  `until` and `for` flow through it, and `sameGate`/`configWarnings` reuse it
+  for never-wins detection.
+- Never-wins detection (`configWarnings`, pure, in config.go) is exact and
+  non-blocking: a later always-active entry (static/interval/sequential, or an
+  all-day daily with no gates; `on_error: skip` excluded) or a later daily
+  with the identical normalized gate. Served via `/api/status` `warnings` and
+  `/api/config/validate` — never rendered in admin.html.
 - Timeline planning (admin UI) is also pure and structural (`servedAt`,
   `conditionText`, `candidates`, `prevSlot`, `nextSlot`, `buildTimeline`) —
   no fetch checks; 48h horizon. Keep it that way when extending. It is served

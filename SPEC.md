@@ -27,7 +27,7 @@ Design principles:
   files (see §3); `admin.html` embedded via `go:embed`; the sample config is a
   Go string constant (`sampleConfig`) — no `config.yaml` file is shipped with
   the project.
-- Final Docker image built from `scratch`, target size ~6–8 MB.
+- Final Docker image built from `scratch`, target size ~12 MB (~3.5 MB gzipped).
 - No logging framework, no metrics, no authentication. Only a single startup line.
 - Timezone support is opt-in via `tz:` (IANA name); the tz database is embedded
   in the binary (`time/tzdata`), so it works in the scratch image with no extra
@@ -116,8 +116,14 @@ images:
                              #           window is active (needs >= 2 sources)
       at: "18:00"            # daily: window start, HH:MM (required)
       until: "06:00"         # daily: window end, optional (default: midnight)
+      for: 8h                # daily: alternative to `until` — window length,
+                             #   mutually exclusive with `until`, whole minutes
+                             #   only, 24h = all day
       dates: ["25-12"]       # daily: optional calendar dates (DD-MM) the entry
                              #   is limited to; combines with the time window
+      weekdays: [mon, fri]   # daily: optional weekdays (mon..sun,
+                             #   case-insensitive); AND-combines with the
+                             #   time window and dates
 
     refresh: 15m             # optional per-entry override of global `refresh`
                              #   (remote sources only)
@@ -132,37 +138,51 @@ images:
 | `rotation.type: sequential` | ≥2 sources | Always active; advances one step **per GET request**: first hit serves `sources[0]`, next `sources[1]`, ... wrapping around. In-memory state (per-entry cursor), reset on restart; HEAD requests and `?id=` previews do not advance. |
 | `rotation.type: daily` + `at` | 1 source | Active from `at` until midnight (in `tz`). The override mechanism — place it *after* the always-active entries it should shadow. |
 | `rotation.type: daily` + `at` + `until` | 1 source | Active within `[at, until)`. If `until <= at`, the window wraps past midnight (e.g. `at: "22:00", until: "06:00"` = evening + night). |
+| `rotation.type: daily` + `at` + `for` | 1 source | Window **length** instead of an end time: `at: "22:00" for: 8h` = 22:00–06:00. Mutually exclusive with `until`; whole minutes only; `for: 24h` = all day. |
 | `rotation.type: daily` + `dates` | ≥1 source | Date gate: active only on the listed `DD-MM` calendar days (evaluated in `tz`). Combines with the time window — both must match. `at: "00:00"` with the default `until` = all day. |
+| `rotation.type: daily` + `weekdays` | ≥1 source | Weekday gate: active only on the listed weekdays (`mon`…`sun`, case-insensitive). Combines with the time window **and** `dates` — all must match. |
 | `rotation.type: daily` + `every` | ≥2 sources | Composition: while the daily window is active, also cycle the sources every `every`. |
 | `refresh` | remote | Re-download cadence for *changing* content (camera snapshots, weather maps). Distinct from `every`: `every` picks **which** source, `refresh` updates the **bytes** of one source. |
 | `on_error` | all | Fetch-failure behavior for this entry: `skip` (treat the entry as inactive this request, so the next earlier active entry is served) or `placeholder` (serve the built-in 1×1 transparent GIF). |
 
-### 4.4 Daily window rule & date gate
+### 4.4 Daily window rule & gates
 
 The daily gate is evaluated against the **wall clock in the configured
-timezone** (`tz`, default `TZ` env or UTC), so `at`/`until`/`dates` mean what
-they say on a local clock.
+timezone** (`tz`, default `TZ` env or UTC), so `at`/`until`/`for`/`dates`/
+`weekdays` mean what they say on a local clock.
 
-Time window, in minutes since local midnight: active iff `at <= mins < until`.
-When `until <= at` the window wraps past midnight: active iff
-`mins >= at || mins < until`. (`at == until` = the full 24 hours.) DST edge
-days follow wall-clock semantics: an hour skipped by a spring-forward
-transition never matches; an hour repeated by a fall-back transition matches
-twice.
+Time window, in minutes since local midnight: active iff
+`start <= mins < start+dur`, where `start` = `at` and `dur` is:
+
+- `for` in whole minutes when set (`for: 24h` = 1440 = the full day), else
+- `(until - at + 1440) % 1440`, with `0` (i.e. `at == until`) meaning 1440.
+
+When `start+dur > 1440` the window wraps past midnight: active iff
+`mins >= start || mins < start+dur-1440`. DST edge days follow wall-clock
+semantics: an hour skipped by a spring-forward transition never matches; an
+hour repeated by a fall-back transition matches twice.
 
 Date gate (`dates`, optional): active only when the local calendar date is in
 the list (`DD-MM`, recurring every year). `29-02` is accepted but never matches
-in non-leap years. When both a time window and a date gate are present, both
-must match.
+in non-leap years.
+
+Weekday gate (`weekdays`, optional): active only when the local weekday is in
+the list (`mon`..`sun`, case-insensitive, normalized to lowercase at parse).
+
+When several gates are present (time window, `dates`, `weekdays`), **all must
+match**.
 
 ### 4.5 Formats
 
 - Times: `"HH:MM"`, 24-hour, interpreted in the configured `tz`
   (`time.Parse("15:04", ...)`).
 - Dates: `"DD-MM"` (day-month), recurring every year; e.g. `"25-12"`.
-- Durations (`every`, `refresh`, `timeout`): Go duration strings (`"30m"`, `"6h"`,
+- Durations (`every`, `for`, `refresh`, `timeout`): Go duration strings (`"30m"`, `"6h"`,
   `"3600s"`, `"24h"`) or a plain integer, which means seconds. `never` is accepted
-  for `refresh` (= cache forever).
+  for `refresh` (= cache forever). `for` must be a whole number of minutes
+  (window gates are minute-granular) and at most 24h; `for: 0`/`never` = unset,
+  same as `every`. Durations must be whole seconds — sub-second values
+  (`"500ms"`, `"1.5s"`) are rejected rather than truncated.
 
 ### 4.6 Validation — structural only
 
@@ -189,6 +209,15 @@ that are *structurally* broken. All of these produce a clear error message
 - A `placeholder` that is not a non-empty path or `http(s)://` URL — reject.
 - `dates` on a rotation type other than `daily` — reject with hint:
   "`dates` requires `type: daily`".
+- `for` / `weekdays` on a rotation type other than `daily` — reject with hint:
+  "`dates`/`weekdays`/`for` require `type: daily`".
+- `at` / `until` on a rotation type other than `daily` — reject with hint:
+  "`at`/`until` require `type: daily`" (they would otherwise be silently
+  ignored, making the entry always-active).
+- `until` and `for` together on a `daily` entry — reject (the two window
+  encodings are mutually exclusive).
+- `for` negative, not a whole number of minutes, or over 24h — reject.
+- `weekdays` element that is not `mon`..`sun` — reject (case-insensitive).
 - `interval` with a single source — reject with hint: "use `static`, or `refresh`
   if you want to re-download one changing image".
 - `daily` with ≥2 sources and no `every` — reject with hint: "add `every` to
@@ -199,6 +228,22 @@ that are *structurally* broken. All of these produce a clear error message
 - `sequential` with `every` — reject (it advances per request, not per time).
 - `sequential` with `on_error: skip` — reject (skip pre-checks the current
   source, which is unknowable before the advance; use `placeholder`).
+
+Warnings (non-blocking, never a save failure): `configWarnings` detects
+entries that can **never be served** and reports them via `/api/status`
+(`warnings`) and `/api/config/validate`:
+
+- a later always-active entry (static/interval/sequential, or an all-day
+  `daily` with no gates) shadows everything before it — hint: "move
+  always-active entries above daily ones";
+- a later `daily` entry with the identical gate — the same `(at, dur)` window
+  (`until` and `for` are alternative encodings, compared after normalization)
+  plus the same `dates` and `weekdays` sets — shadows the earlier one.
+
+`on_error: skip` entries are excluded from the "always active" claim: when
+their fetch fails, earlier entries still serve. Like the timeline, warnings
+are structural (no fetch checks), so a failing `skip` entry can diverge from
+what `/image` actually serves.
 
 ### 4.7 Sample config
 
@@ -265,12 +310,31 @@ images:
       until: "06:00"
 
   # Christmas background: all day on 25-12 (overrides everything above that day)
-  - id: christmas
-    sources: christmas.jpg
-    rotation:
-      type: daily
-      dates: ["25-12"]
-      at: "00:00"
+  # - id: christmas
+  #   sources: christmas.jpg
+  #   rotation:
+  #     type: daily
+  #     dates: ["25-12"]
+  #     at: "00:00"
+
+  # More daily-window options (both commented out; see README for details):
+  # "for:" is a window length — an alternative to "until" (mutually exclusive;
+  # whole minutes; 24h = all day). 22:00 "for" 8h = 22:00–06:00, no arithmetic:
+  # - id: night-for
+  #   sources: night.jpg
+  #   rotation:
+  #     type: daily
+  #     at: "22:00"
+  #     for: 8h
+  # "weekdays:" limits an entry to specific weekdays (mon..sun, case-insensitive)
+  # and combines with the time window and "dates" — all must match. Weekends only:
+  # - id: weekend
+  #   sources: weekend.jpg
+  #   rotation:
+  #     type: daily
+  #     at: "08:00"
+  #     for: 10h
+  #     weekdays: [sat, sun]
 ```
 
 ## 5. Image selection logic
@@ -360,9 +424,9 @@ the cooldown.
 | `/favicon.svg` | GET | The app favicon as SVG (same mark the admin UI uses) so dashboards such as Homepage can reference it as an app icon. Static, served with `Cache-Control: public, max-age=86400`. |
 | `/api/config` | GET | Returns the current `config.yaml` content as plain text. |
 | `/api/config` | POST | Validates the request body (§4.6), writes it atomically to `CONFIG_PATH` (`<path>.tmp` + rename), triggers a reload, returns `200 OK` — or `400` with the error details. Body capped at 1 MB (`http.MaxBytesReader`). |
-| `/api/config/validate` | POST | Dry-run of the POST above: parses and validates the body but never writes or reloads. `200` with `{"valid":true}` on a valid config, `400` with the exact validation error otherwise. Powers the admin UI's live validity indicator. Body capped at 1 MB. |
+| `/api/config/validate` | POST | Dry-run of the POST above: parses and validates the body but never writes or reloads. `200` with `{"valid":true,"warnings":[...]}` on a valid config (warnings are non-blocking, §4.6), `400` with the exact validation error otherwise. Powers the admin UI's live validity indicator. Body capped at 1 MB. |
 | `/api/preview?src=` | GET | Raw bytes of one source (local path or remote URL) from the dedicated preview cache (`previewCached`), so the admin UI can preview sources that are not part of the saved config yet. `ETag` (SHA-256 of the bytes) + `If-None-Match` → `304` keep polling transfers minimal. `400` for an invalid `src`; `404` when the fetch fails. |
-| `/api/status` | GET | JSON: `{utc_now, timezone, active_entry_id, active_source, config_path, config_mtime, last_error, cache_entries, theme, timeline}` — the debugging aid for "why is my dashboard showing the wrong picture" plus everything the admin UI polls. `theme` carries the effective theme (`mode` plus `dark`/`light` palettes, defaults filled in); `timeline` is the full timeline payload: per-entry conditions, the prev/current/next carousel slots, and the next scheduled change (`next_change.at` RFC3339 UTC + `in_seconds`). See §8. (Formerly served by the removed `/api/timeline`.) |
+| `/api/status` | GET | JSON: `{utc_now, timezone, active_entry_id, active_source, config_path, config_mtime, last_error, warnings, cache_entries, theme, timeline}` — the debugging aid for "why is my dashboard showing the wrong picture" plus everything the admin UI polls. `warnings` is the never-wins list (§4.6). `theme` carries the effective theme (`mode` plus `dark`/`light` palettes, defaults filled in); `timeline` is the full timeline payload: per-entry conditions, the prev/current/next carousel slots, and the next scheduled change (`next_change.at` RFC3339 UTC + `in_seconds`). See §8. (Formerly served by the removed `/api/timeline`.) |
 | `/health` | GET | `200 OK` (plain text). |
 
 `/image` response headers: `Content-Type`, `ETag` (hash of the bytes),
@@ -403,7 +467,9 @@ Layout, top to bottom:
   line numbers. The gutter scrolls in sync with the textarea; line numbers
   update on every keystroke.
 - **Footer**: config path, mtime, cache-entry count from `/api/status`; the
-  banner shows `last_error` when set.
+  banner shows `last_error` when set. Structural warnings (§4.6) are served
+  on `/api/status` for scripts and clients, but are **not** rendered in the
+  UI (backend-only).
 
 The client preview loader is a **blob cache keyed by source**: one
 `GET /api/preview` per source, one shared objectURL reused by the three
@@ -432,9 +498,11 @@ is not dirty. A successful save reloads everything immediately.
 - `loadConfig(path)`:
   1. Read + strict-parse + validate (§4.6).
   2. On any error: **keep the last good config**, record the error (exposed via
-     `/api/status` and the admin UI). Never blank the running config.
-  3. On success: swap the config (under mutex), evict stale cache entries
-     (§6), pre-warm the winning source (fetch now, tolerate failure).
+     `/api/status` and the admin UI). Never blank the running config. The last
+     good config's warnings are preserved.
+  3. On success: compute the structural warnings (§4.6), swap the config (under
+     mutex), evict stale cache entries (§6), pre-warm the winning source
+     (fetch now, tolerate failure).
 - Startup: if `CONFIG_PATH` does not exist, write the built-in sample config
   (the `sampleConfig` Go constant, §4.7) to that path and continue
   (fresh-volume friendly); the watcher picks up later edits.
@@ -444,7 +512,7 @@ is not dirty. A successful save reloads everything immediately.
 - `POST /api/config` calls `loadConfig()` after the atomic write (the watcher will
   also see the change and reload once more — harmless).
 
-## 10. Dockerfile (scratch, ~6–8 MB)
+## 10. Dockerfile (scratch, ~12 MB)
 
 ```dockerfile
 # Stage 1: Builder
