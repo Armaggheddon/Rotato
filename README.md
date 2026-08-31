@@ -311,10 +311,11 @@ Then move the image to the Pi with a tarball:
 
 ```bash
 # on the build machine
-docker save rotato:latest | gzip > rotato-arm64.tar.gz
+docker save rotato:latest > rotato-arm64.tar
 
-# copy the tarball over, then on the Pi:
-gunzip -c rotato-arm64.tar.gz | docker load
+# copy the tarball over, then on the Pi and run
+# scp rotato-arm64.tar <user>@<address>:~/rotato
+docker load -i rotato-arm64.tar
 docker compose up -d
 ```
 
@@ -350,26 +351,12 @@ services:
       - ./data:/app/data
 ```
 
-Findings from a real Pi deployment:
+> [!NOTE]
+> The image **manifest** carries the build host's architecture, while the **binary inside** is the cross-compiled target. Docker prints a warning when they differ, but the image runs fine. Do **not** add `platform:linux/arm64` to the compose file: that makes Docker look for a matching manifest in a registry instead of using the local image.
 
-- The image **manifest** carries the build host's architecture, while the
-  **binary inside** is the cross-compiled target. Docker prints a warning when
-  they differ, but the image runs fine. Do **not** add `platform:
-  linux/arm64` to the compose file: that makes Docker look for a matching
-  manifest in a registry instead of using the local image.
-- `config/` and `data/` must be writable by the container user (`PUID:PGID`,
-  default `1000:1000`), otherwise the config auto-seed and admin-UI saves fail.
-- Updating after a rebuild is the same save/load dance:
+> [!NOTE]
+> `config/` and `data/` must be writable by the container user (`PUID:PGID`, default `1000:1000`), otherwise the config auto-seed and admin-UI saves fail.
 
-```bash
-# on the build machine
-TARGETARCH=arm64 docker compose build
-docker save rotato:latest | gzip > rotato-arm64.tar.gz
-
-# copy the tarball over, then on the Pi:
-gunzip -c rotato-arm64.tar.gz | docker load
-docker compose up -d --force-recreate
-```
 
 ## HTTP API
 
